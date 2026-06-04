@@ -1,0 +1,13 @@
+# RJH local data — never commit your DB, audit trail, or generated documents
+rjh_data/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+.env
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
