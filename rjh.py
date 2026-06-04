@@ -923,7 +923,32 @@ INDEX_HTML = r"""<!DOCTYPE html>
     border-radius:50%;animation:spin 1s linear infinite}
   @keyframes spin{to{transform:rotate(360deg)}}
   .ov-box{background:var(--card);border:1px solid var(--line);border-radius:12px;
-    padding:22px 28px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:12px}
+    padding:22px 28px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:12px;max-width:420px}
+  .ov-box .sub{font-size:12px;color:var(--mut);line-height:1.5}
+  button.btn{transition:filter .15s,opacity .15s}
+  button.btn:hover:not(:disabled){filter:brightness(1.12)}
+  nav button{transition:color .15s,background .15s}
+  tbody tr{transition:background .12s}
+  tbody tr:hover{background:#1a2336}
+  input:focus,select:focus,textarea:focus{outline:none;border-color:var(--acc);
+    box-shadow:0 0 0 2px rgba(99,102,241,.25)}
+  .stat{transition:border-color .15s}
+  .stat:hover{border-color:var(--acc)}
+  .toast{box-shadow:0 6px 24px #0007;border-left:3px solid var(--acc)}
+  .toast.err{border-left-color:var(--bad)}
+  .toast.ok{border-left-color:var(--good)}
+  .hint{font-size:11px;color:var(--mut);margin-top:6px}
+  .docmeta{font-size:12px;color:var(--mut);margin-left:auto;align-self:center}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-thumb{background:#2a3650;border-radius:8px}
+  ::-webkit-scrollbar-track{background:transparent}
+  @media (max-width:760px){
+    .stats{grid-template-columns:1fr 1fr}
+    .grid2,.grid3{grid-template-columns:1fr}
+    nav{margin-left:0;width:100%}
+    header{flex-wrap:wrap}
+    main{padding:14px}
+  }
 </style></head>
 <body>
 <header>
@@ -978,14 +1003,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
     produce a tailored resume and cover letter here.</span></div>
   <div class="card hide" id="docsPanel">
     <div class="row"><h3 id="docsTitle" style="margin:0"></h3>
-      <button class="btn" id="regenBtn" style="margin-left:auto">Regenerate</button></div>
+      <span class="docmeta" id="docsMeta"></span>
+      <button class="btn sec" id="regenBtn">Regenerate</button></div>
     <label>Tailored resume</label>
     <textarea id="resumeBox"></textarea>
     <div class="row"><button class="btn sec" onclick="copyBox('resumeBox')">Copy resume</button></div>
     <label>Cover letter</label>
     <textarea id="coverBox"></textarea>
-    <div class="row"><button class="btn sec" onclick="copyBox('coverBox')">Copy cover letter</button>
-      <button class="btn" id="prefillBtn" style="margin-left:auto">Pre-fill application (you submit)</button></div>
+    <div class="row">
+      <button class="btn sec" onclick="copyBox('coverBox')">Copy cover letter</button>
+      <button class="btn sec" id="saveDocsBtn">Save edits</button>
+      <button class="btn" id="prefillBtn" style="margin-left:auto">Pre-fill application (you submit)</button>
+    </div>
+    <div class="hint">Edits are saved locally and used during pre-fill. Pre-fill opens a real
+      browser, fills what it can, and stops — you review and submit yourself.</div>
   </div>
 </section>
 
@@ -1053,12 +1084,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </main>
 <div id="toast" class="toast hide"></div>
 <div id="overlay" class="hide"><div class="ov-box"><div class="spinner"></div>
-  <div id="overlayMsg">Working…</div></div></div>
+  <div id="overlayMsg">Working…</div><div class="sub" id="overlaySub"></div></div></div>
 <script>
 let currentJob = null;
-function toast(m){const t=document.getElementById('toast');t.textContent=m;
-  t.classList.remove('hide');setTimeout(()=>t.classList.add('hide'),2800);}
-function showOverlay(m){document.getElementById('overlayMsg').textContent=m||'Working…';
+let jobsCache = {};
+function toast(m,kind){const t=document.getElementById('toast');t.textContent=m;
+  t.className='toast'+(kind?' '+kind:'');
+  setTimeout(()=>t.classList.add('hide'),3000);}
+function showOverlay(m,sub){document.getElementById('overlayMsg').textContent=m||'Working…';
+  document.getElementById('overlaySub').textContent=sub||'';
   document.getElementById('overlay').classList.remove('hide');}
 function hideOverlay(){document.getElementById('overlay').classList.add('hide');}
 function copyBox(id){const el=document.getElementById(id);el.select();
@@ -1101,40 +1135,58 @@ async function loadJobs(){
   const st=document.getElementById('statusFilter').value;
   const ms=document.getElementById('minScore').value||0;
   const jobs=await api(`/api/jobs?q=${q}&status=${st}&min_score=${ms}`);
+  jobsCache={};
   const body=document.getElementById('jobsBody');body.innerHTML='';
-  if(!jobs.length){body.innerHTML='<tr><td colspan="6" class="muted">No jobs yet. Click Collect jobs.</td></tr>';}
+  if(!jobs.length){body.innerHTML='<tr><td colspan="6" class="muted">No jobs match. '
+    +'Click <b>Collect jobs</b> to fetch from your enabled sources.</td></tr>';loadStats();return;}
   jobs.forEach(j=>{
+    jobsCache[j.id]=j;
+    const hasDocs=(j.status==='generated'||j.status==='applied');
+    const genLabel=hasDocs?'Regenerate':'Generate';
     const tr=document.createElement('tr');
     tr.innerHTML=`<td>${scoreBadge(j.score)}</td>
-      <td><a href="${j.url}" target="_blank" rel="noopener">${j.title||''}</a>
+      <td><a href="${j.url}" target="_blank" rel="noopener">${j.title||'(untitled)'}</a>
         <div class="muted" style="font-size:11px">${j.source||''}</div></td>
       <td>${j.company||''}</td>
       <td>${(j.location||'')||(j.country||'')}</td>
       <td>${statusPill(j.status)}</td>
       <td class="row">
-        <button class="btn" data-gen="${j.id}">Generate</button>
+        <button class="btn" data-gen="${j.id}">${genLabel}</button>
+        ${hasDocs?`<button class="btn sec" data-docs="${j.id}">Open docs</button>`:''}
         <button class="btn sec" data-short="${j.id}">Shortlist</button>
         <button class="btn sec" data-arch="${j.id}">Archive</button>
       </td>`;
     body.appendChild(tr);
   });
   body.querySelectorAll('[data-gen]').forEach(b=>b.onclick=()=>generate(b.dataset.gen));
+  body.querySelectorAll('[data-docs]').forEach(b=>b.onclick=()=>openExisting(b.dataset.docs));
   body.querySelectorAll('[data-short]').forEach(b=>b.onclick=()=>setStatus(b.dataset.short,'shortlisted'));
   body.querySelectorAll('[data-arch]').forEach(b=>b.onclick=()=>setStatus(b.dataset.arch,'archived'));
   loadStats();
 }
 
+async function openExisting(id){
+  try{
+    const r=await api(`/api/documents/${id}`);
+    if(!(r.resume||'').trim() && !(r.cover_letter||'').trim()){
+      return toast('No documents yet — click Generate first.');
+    }
+    openDocs(jobsCache[id],r.resume,r.cover_letter);
+  }catch(e){toast('Could not load documents.','err');}
+}
+
 async function setStatus(id,status){
   await api(`/api/jobs/${id}/status`,{method:'POST',
     headers:{'content-type':'application/json'},body:JSON.stringify({status})});
-  toast('Updated');loadJobs();}
+  toast('Status updated','ok');loadJobs();}
 
 async function generate(id){
-  showOverlay('Generating locally with Ollama…');
+  showOverlay('Generating locally with Ollama…','This runs entirely on your machine.');
   try{
     const r=await api(`/api/generate/${id}`,{method:'POST'});
     openDocs(r.job,r.resume,r.cover_letter);loadJobs();
-  }catch(e){toast('Generation failed. Is Ollama running and the model pulled?');}
+    toast('Documents generated','ok');
+  }catch(e){toast('Generation failed. Is Ollama running and the model pulled?','err');}
   finally{hideOverlay();}
 }
 
@@ -1143,31 +1195,51 @@ function openDocs(job,resume,cover){
   document.querySelector('nav button[data-tab="docs"]').click();
   document.getElementById('docsEmpty').classList.add('hide');
   document.getElementById('docsPanel').classList.remove('hide');
-  document.getElementById('docsTitle').textContent=job.title+' — '+(job.company||'');
-  document.getElementById('resumeBox').value=resume;
-  document.getElementById('coverBox').value=cover;
+  document.getElementById('docsTitle').textContent=(job.title||'(untitled)')+' — '+(job.company||'');
+  document.getElementById('docsMeta').textContent=statusLabel(job.status);
+  document.getElementById('resumeBox').value=resume||'';
+  document.getElementById('coverBox').value=cover||'';
+}
+function statusLabel(s){return s?('status: '+s):'';}
+
+async function saveDocs(silent){
+  if(!currentJob)return false;
+  try{
+    await api(`/api/documents/${currentJob.id}`,{method:'POST',
+      headers:{'content-type':'application/json'},
+      body:JSON.stringify({resume:document.getElementById('resumeBox').value,
+        cover_letter:document.getElementById('coverBox').value})});
+    if(!silent){toast('Edits saved','ok');loadJobs();}
+    return true;
+  }catch(e){if(!silent)toast('Save failed','err');return false;}
 }
 
+document.getElementById('saveDocsBtn').onclick=()=>saveDocs(false);
 document.getElementById('regenBtn').onclick=()=>{if(currentJob)generate(currentJob.id);};
 document.getElementById('prefillBtn').onclick=async()=>{
   if(!currentJob)return;
   if(!confirm('This opens a real browser and pre-fills what it can. It will NOT submit. '
     +'You review and submit yourself. Continue?'))return;
-  showOverlay('Launching browser… watch your desktop.');
-  try{const r=await api(`/api/prefill/${currentJob.id}`,{method:'POST'});toast(r.msg);}
-  catch(e){toast('Pre-fill failed: '+e.message);}
+  await saveDocs(true);  // use your latest edits during pre-fill
+  showOverlay('Browser opening on the desktop…',
+    'Review and submit in that browser, then press Enter in the RJH terminal to close it.');
+  try{const r=await api(`/api/prefill/${currentJob.id}`,{method:'POST'});
+    toast(r.msg, r.ok===false?'err':'ok');}
+  catch(e){toast('Pre-fill failed: '+e.message,'err');}
   finally{hideOverlay();}
 };
 
 document.getElementById('collectBtn').onclick=async()=>{
-  showOverlay('Collecting (robots-aware, rate-limited)…');
+  showOverlay('Collecting jobs…','robots.txt-aware and rate-limited per domain.');
   try{const r=await api('/api/collect',{method:'POST'});
-    toast(`Added ${r.added}, skipped ${r.skipped} duplicates`);loadJobs();}
-  catch(e){toast('Collect failed');}
+    toast(`Added ${r.added}, skipped ${r.skipped} duplicate(s)`,'ok');loadJobs();}
+  catch(e){toast('Collect failed','err');}
   finally{hideOverlay();}
 };
 document.getElementById('searchBtn').onclick=loadJobs;
 document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')loadJobs();});
+document.getElementById('statusFilter').onchange=loadJobs;
+document.getElementById('minScore').onchange=loadJobs;
 
 async function loadProfile(){
   const p=await api('/api/profile');
@@ -1185,7 +1257,7 @@ document.getElementById('saveProfile').onclick=async()=>{
     resume:pResume.value};
   await api('/api/profile',{method:'POST',headers:{'content-type':'application/json'},
     body:JSON.stringify(body)});
-  toast('Profile saved. New jobs will be scored against it.');
+  toast('Profile saved. New jobs will be scored against it.','ok');
 };
 
 async function loadSettings(){
@@ -1199,8 +1271,8 @@ async function loadSettings(){
 }
 document.getElementById('saveSettings').onclick=async()=>{
   let sources,mappings;
-  try{sources=JSON.parse(cSources.value);}catch(e){return toast('Sources JSON is invalid');}
-  try{mappings=JSON.parse(cMappings.value);}catch(e){return toast('Site rules JSON is invalid');}
+  try{sources=JSON.parse(cSources.value);}catch(e){return toast('Sources JSON is invalid','err');}
+  try{mappings=JSON.parse(cMappings.value);}catch(e){return toast('Site rules JSON is invalid','err');}
   const body={ollama_url:cOllamaUrl.value,ollama_model:cOllamaModel.value,
     output_language:cLang.value,rate_limit_seconds:Number(cRate.value),
     request_timeout:Number(cTimeout.value),
@@ -1208,7 +1280,7 @@ document.getElementById('saveSettings').onclick=async()=>{
     sources,site_mappings:mappings};
   await api('/api/config',{method:'POST',headers:{'content-type':'application/json'},
     body:JSON.stringify(body)});
-  toast('Settings saved');refreshOllama();
+  toast('Settings saved','ok');refreshOllama();
 };
 
 async function loadAudit(){
@@ -1321,6 +1393,31 @@ def api_generate(job_id: int):
     job = dict(row)
     docs = generate_documents(job, get_profile(), cfg)
     return {"job": job, **docs}
+
+
+@app.get("/api/documents/{job_id}")
+def api_get_documents(job_id: int):
+    docs = get_documents(job_id)
+    return {"resume": docs.get("resume", ""),
+            "cover_letter": docs.get("cover_letter", "")}
+
+
+@app.post("/api/documents/{job_id}")
+async def api_save_documents(job_id: int, request: Request):
+    data = await request.json()
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    with _db_lock, db() as conn:
+        if not conn.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone():
+            return JSONResponse({"error": "not found"}, status_code=404)
+        conn.execute("DELETE FROM documents WHERE job_id = ?", (job_id,))
+        conn.execute("INSERT INTO documents (job_id,kind,content,created_at) VALUES (?,?,?,?)",
+                     (job_id, "resume", data.get("resume", ""), now))
+        conn.execute("INSERT INTO documents (job_id,kind,content,created_at) VALUES (?,?,?,?)",
+                     (job_id, "cover_letter", data.get("cover_letter", ""), now))
+        conn.execute("UPDATE jobs SET status = 'generated' WHERE id = ? "
+                     "AND status IN ('new','shortlisted')", (job_id,))
+    audit("documents_edited", "job_id={}".format(job_id))
+    return {"ok": True}
 
 
 @app.post("/api/prefill/{job_id}")
