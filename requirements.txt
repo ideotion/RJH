@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+requests
+# Optional: only needed for the browser pre-fill step.
+# After installing, run:  playwright install chromium
+playwright
