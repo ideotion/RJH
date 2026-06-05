@@ -3,6 +3,11 @@ RJH - Reverse Job Hunting.
 
 An ethical, open-source, local-first job-application copilot.
 
+SPDX-License-Identifier: GPL-3.0-or-later
+Copyright (C) 2026 Ideotion. Licensed under the GNU General Public License v3.0
+or later. See the LICENSE file for the full text. This program comes with
+ABSOLUTELY NO WARRANTY.
+
 WHAT IT DOES
   1. Collects job postings from config-driven source adapters (RSS/Atom feeds),
      respecting robots.txt and per-domain rate limits.
@@ -29,7 +34,10 @@ INSTALL
   pip install fastapi uvicorn requests
   # optional, only for the form pre-fill assistant:
   pip install playwright && playwright install chromium
-  # local LLM: install Ollama from https://ollama.com, then:  ollama pull mistral
+  # optional, only for importing PDF/ODT resumes:
+  pip install pypdf odfpy
+  # local LLM: install/manage Ollama and models from the Settings -> Setup tab
+  # in the GUI, or manually from https://ollama.com (then:  ollama pull mistral)
 
 RUN
   python3 rjh.py
@@ -42,11 +50,14 @@ import csv
 import json
 import time
 import html
+import shutil
 import hashlib
 import sqlite3
+import platform
 import threading
+import subprocess
 import datetime as dt
-from io import StringIO
+from io import StringIO, BytesIO
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from urllib import robotparser
 from xml.etree import ElementTree as ET
@@ -60,13 +71,27 @@ try:
 except ImportError:
     raise SystemExit("Missing dependencies. Run:  pip install fastapi uvicorn requests")
 
-# Optional: only needed for the browser pre-fill step. Guarded so the app runs
-# fully without it.
+# Optional dependencies. Each is guarded so the app runs fully without it, and
+# the guards catch BaseException (not just ImportError): a broken optional dep —
+# e.g. a package whose native extension panics on import — must disable only its
+# own feature, never take down the whole app.
 try:
     from playwright.sync_api import sync_playwright  # noqa: F401
     PLAYWRIGHT_AVAILABLE = True
-except ImportError:
+except BaseException:
     PLAYWRIGHT_AVAILABLE = False
+
+# Only needed to import PDF / ODT resumes. Both parse fully locally.
+try:
+    import pypdf  # noqa: F401
+    PYPDF_AVAILABLE = True
+except BaseException:
+    PYPDF_AVAILABLE = False
+try:
+    import odf  # noqa: F401  (odfpy)
+    ODFPY_AVAILABLE = True
+except BaseException:
+    ODFPY_AVAILABLE = False
 
 
 # --------------------------------------------------------------------------- #
@@ -528,15 +553,99 @@ def score_job(job, profile, cfg):
 # Ollama (local LLM) document generation
 # --------------------------------------------------------------------------- #
 
+def ollama_binary():
+    """Path to the locally installed `ollama` binary, or None."""
+    return shutil.which("ollama")
+
+
+def ollama_version():
+    path = ollama_binary()
+    if not path:
+        return ""
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True,
+                             timeout=8)
+        return (out.stdout or out.stderr or "").strip()
+    except Exception:
+        return ""
+
+
 def ollama_status(cfg):
+    """Combined local-engine status: whether the binary is installed, whether the
+    server responds, its version, and the models it has pulled."""
+    installed = ollama_binary() is not None
+    status = {"installed": installed, "up": False, "models": [],
+              "version": ollama_version() if installed else "",
+              "platform": platform.system().lower()}
     try:
         r = requests.get(cfg["ollama_url"] + "/api/tags", timeout=4)
         if r.status_code == 200:
-            models = [m.get("name") for m in r.json().get("models", [])]
-            return {"up": True, "models": models}
+            status["up"] = True
+            status["models"] = [m.get("name") for m in r.json().get("models", [])]
     except Exception:
         pass
-    return {"up": False, "models": []}
+    return status
+
+
+def ollama_install():
+    """Guided install of the Ollama engine on Linux via the official script.
+    Triggered only by an explicit, confirmed user action in the GUI. Downloads
+    from ollama.com (the engine itself — never any candidate data)."""
+    if ollama_binary():
+        return {"ok": True, "msg": "Ollama is already installed.",
+                "version": ollama_version()}
+    if platform.system().lower() != "linux":
+        return {"ok": False,
+                "msg": "Automatic install supports Linux only. Install Ollama "
+                       "manually from https://ollama.com/download for your OS."}
+    if not shutil.which("curl") and not shutil.which("sh"):
+        return {"ok": False, "msg": "curl/sh not found; cannot run the installer."}
+    audit("ollama_install_start", "linux official script")
+    try:
+        # The official one-line installer. Captured so the GUI can show the result.
+        proc = subprocess.run("curl -fsSL https://ollama.com/install.sh | sh",
+                              shell=True, capture_output=True, text=True, timeout=600)
+        tail = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()[-1500:]
+        if ollama_binary():
+            audit("ollama_install_done", ollama_version())
+            return {"ok": True, "msg": "Ollama installed. Start it with `ollama serve`.",
+                    "version": ollama_version(), "log": tail}
+        audit("ollama_install_failed", "exit={}".format(proc.returncode))
+        return {"ok": False,
+                "msg": "Installer finished but `ollama` was not found on PATH. "
+                       "See the log; you may need to install manually.",
+                "log": tail}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "msg": "Install timed out after 10 minutes."}
+    except Exception as e:
+        return {"ok": False, "msg": "Install error: {}".format(e)}
+
+
+def ollama_pull(cfg, model):
+    """Pull a model into the local Ollama instance via its local API."""
+    model = (model or "").strip()
+    if not model:
+        return {"ok": False, "msg": "No model name given."}
+    if not ollama_binary():
+        return {"ok": False, "msg": "Ollama is not installed yet. Install it first."}
+    audit("ollama_pull_start", model)
+    try:
+        r = requests.post(cfg["ollama_url"] + "/api/pull",
+                          json={"name": model, "stream": False}, timeout=3600)
+        if r.status_code != 200:
+            return {"ok": False,
+                    "msg": "Pull failed ({}). Is `ollama serve` running?".format(
+                        r.status_code)}
+        data = r.json()
+        if isinstance(data, dict) and data.get("error"):
+            return {"ok": False, "msg": "Pull failed: {}".format(data["error"])}
+        audit("ollama_pull_done", model)
+        return {"ok": True, "msg": "Model '{}' is ready.".format(model)}
+    except requests.exceptions.ConnectionError:
+        return {"ok": False,
+                "msg": "Could not reach Ollama. Start it with `ollama serve`."}
+    except Exception as e:
+        return {"ok": False, "msg": "Pull error: {}".format(e)}
 
 
 def ollama_chat(cfg, system, user):
@@ -592,6 +701,50 @@ def generate_documents(job, profile, cfg):
         conn.execute("UPDATE jobs SET status = 'generated' WHERE id = ?", (job["id"],))
     audit("generate", "job_id={} title={}".format(job["id"], job["title"]))
     return {"resume": resume, "cover_letter": cover}
+
+
+# --------------------------------------------------------------------------- #
+# Resume import (PDF / ODT / TXT / Markdown) — all parsing is local
+# --------------------------------------------------------------------------- #
+
+def _extract_pdf(data):
+    if not PYPDF_AVAILABLE:
+        return None, ("PDF import needs pypdf. Run:  pip install pypdf")
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(BytesIO(data))
+        text = "\n".join((page.extract_text() or "") for page in reader.pages)
+        return text.strip(), None
+    except Exception as e:
+        return None, "Could not read PDF: {}".format(e)
+
+
+def _extract_odt(data):
+    if not ODFPY_AVAILABLE:
+        return None, ("ODT import needs odfpy. Run:  pip install odfpy")
+    try:
+        from odf.opendocument import load
+        from odf import text as odf_text, teletype
+        doc = load(BytesIO(data))
+        paras = doc.getElementsByType(odf_text.P)
+        text = "\n".join(teletype.extractText(p) for p in paras)
+        return text.strip(), None
+    except Exception as e:
+        return None, "Could not read ODT: {}".format(e)
+
+
+def extract_resume_text(filename, data):
+    """Return (text, error). Supports PDF and ODT (optional deps) plus plain
+    text / Markdown. Everything is parsed on this machine; nothing is uploaded."""
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in (filename or "") else ""
+    if ext in ("txt", "text", "md", "markdown"):
+        return data.decode("utf-8", "replace").strip(), None
+    if ext == "pdf":
+        return _extract_pdf(data)
+    if ext == "odt":
+        return _extract_odt(data)
+    return None, ("Unsupported file type '.{}'. Use PDF, ODT, TXT, or MD.".format(ext)
+                  if ext else "File has no extension; use PDF, ODT, TXT, or MD.")
 
 
 # --------------------------------------------------------------------------- #
@@ -1038,13 +1191,43 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div><label>Cover letter file (absolute path, optional)</label>
         <input id="pCoverFile" style="width:100%"/></div>
     </div>
-    <label>Master resume (plain text). Everything is generated only from this.</label>
+    <div class="row" style="margin-top:8px;align-items:flex-end">
+      <div style="flex:1;min-width:220px">
+        <label>Master resume (plain text). Everything is generated only from this.</label>
+      </div>
+      <div>
+        <input type="file" id="importFile" accept=".pdf,.odt,.txt,.md" class="hide"/>
+        <button class="btn sec" id="importBtn" title="Import from PDF, ODT, TXT or MD — parsed locally">Import resume…</button>
+      </div>
+    </div>
     <textarea id="pResume" style="min-height:240px"></textarea>
-    <div class="row"><button class="btn" id="saveProfile">Save profile</button></div>
+    <div class="hint" id="importHint">PDF/ODT import is parsed entirely on your machine. Imported
+      text lands here for you to review — click <b>Save profile</b> to keep it.</div>
+    <div class="row" style="margin-top:8px"><button class="btn" id="saveProfile">Save profile</button></div>
   </div>
 </section>
 
 <section id="tab-settings" class="hide">
+  <div class="card">
+    <div class="group-title">Setup — local model engine (Ollama)</div>
+    <div id="setupStatus" class="muted" style="margin-bottom:8px">Checking…</div>
+    <div class="row">
+      <button class="btn" id="installOllamaBtn">Install Ollama</button>
+      <button class="btn sec" id="refreshSetupBtn">Refresh status</button>
+    </div>
+    <div class="hint">Guided install runs Ollama's official Linux installer after you
+      confirm. It downloads the engine from ollama.com — never any of your data.
+      On other systems, install manually from
+      <a href="https://ollama.com/download" target="_blank" rel="noopener">ollama.com/download</a>.</div>
+    <label style="margin-top:12px">Installed models</label>
+    <div id="modelList" class="muted">—</div>
+    <div class="row" style="margin-top:8px">
+      <input id="pullModel" placeholder="model to pull, e.g. mistral" style="flex:1;min-width:160px"/>
+      <button class="btn sec" id="pullModelBtn">Pull model</button>
+    </div>
+    <div class="hint">A multilingual model (e.g. <code>mistral</code>, <code>llama3</code>) is
+      recommended — many European postings are not in English.</div>
+  </div>
   <div class="card">
     <div class="group-title">Local model</div>
     <div class="grid3">
@@ -1052,6 +1235,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div><label>Ollama model</label><input id="cOllamaModel" style="width:100%"/></div>
       <div><label>Output language (auto = match posting)</label><input id="cLang" style="width:100%"/></div>
     </div>
+    <div class="hint">The active model is what document generation uses. Pull it above first.</div>
   </div>
   <div class="card">
     <div class="group-title">Crawling and matching</div>
@@ -1107,6 +1291,7 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('main > section').forEach(s=>s.classList.add('hide'));
   document.getElementById('tab-'+b.dataset.tab).classList.remove('hide');
   if(b.dataset.tab==='audit')loadAudit();
+  if(b.dataset.tab==='settings')loadSetup();
 });
 
 async function refreshOllama(){
@@ -1116,6 +1301,67 @@ async function refreshOllama(){
       ? 'Ollama: up ('+(s.models.join(', ')||'no models')+')' : 'Ollama: offline';
   }catch(e){}
 }
+
+function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+
+async function loadSetup(){
+  let s;
+  try{s=await api('/api/ollama');}catch(e){return;}
+  const st=document.getElementById('setupStatus');
+  const installBtn=document.getElementById('installOllamaBtn');
+  let line;
+  if(!s.installed){line='⚠️ Ollama is <b>not installed</b>.';installBtn.classList.remove('hide');}
+  else{
+    installBtn.classList.add('hide');
+    const v=s.version?(' — '+esc(s.version)):'';
+    line=s.up ? ('✅ Ollama installed and running'+v)
+              : ('🟡 Ollama installed'+v+' but not running. Start it: <code>ollama serve</code>');
+  }
+  if(!s.installed && s.platform!=='linux'){
+    line+=' <span class="muted">(automatic install is Linux-only on this build)</span>';
+    installBtn.classList.add('hide');
+  }
+  st.innerHTML=line;
+  const ml=document.getElementById('modelList');
+  if(s.models && s.models.length){
+    ml.innerHTML=s.models.map(m=>`<span class="pill" style="margin:2px 4px 2px 0;cursor:pointer"
+      data-use="${esc(m)}" title="Use this model for generation">${esc(m)}</span>`).join('');
+    ml.querySelectorAll('[data-use]').forEach(b=>b.onclick=()=>useModel(b.dataset.use));
+  }else{
+    ml.innerHTML='<span class="muted">No models yet'+(s.installed?' — pull one below.':'.')+'</span>';
+  }
+}
+
+async function useModel(model){
+  document.getElementById('cOllamaModel').value=model;
+  try{
+    const c=await api('/api/config');c.ollama_model=model;
+    await api('/api/config',{method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({ollama_model:model})});
+    toast('Active model set to '+model,'ok');refreshOllama();
+  }catch(e){toast('Could not set model','err');}
+}
+
+document.getElementById('refreshSetupBtn').onclick=loadSetup;
+document.getElementById('installOllamaBtn').onclick=async()=>{
+  if(!confirm('Run Ollama\'s official Linux installer now? It downloads and installs '
+    +'the engine from ollama.com. Continue?'))return;
+  showOverlay('Installing Ollama…','Running the official installer — this can take a minute.');
+  try{const r=await api('/api/ollama/install',{method:'POST'});
+    toast(r.msg, r.ok?'ok':'err');}
+  catch(e){toast('Install failed','err');}
+  finally{hideOverlay();loadSetup();refreshOllama();}
+};
+document.getElementById('pullModelBtn').onclick=async()=>{
+  const model=document.getElementById('pullModel').value.trim();
+  if(!model)return toast('Enter a model name first');
+  showOverlay('Pulling '+model+'…','Downloading via your local Ollama. Large models take a while.');
+  try{const r=await api('/api/ollama/pull',{method:'POST',
+    headers:{'content-type':'application/json'},body:JSON.stringify({model})});
+    toast(r.msg, r.ok?'ok':'err');}
+  catch(e){toast('Pull failed','err');}
+  finally{hideOverlay();loadSetup();refreshOllama();}
+};
 
 function scoreBadge(n){const c=n>=70?'g':(n>=40?'a':'r');
   return '<span class="badge '+c+'">'+n+'</span>';}
@@ -1260,6 +1506,23 @@ document.getElementById('saveProfile').onclick=async()=>{
   toast('Profile saved. New jobs will be scored against it.','ok');
 };
 
+document.getElementById('importBtn').onclick=()=>document.getElementById('importFile').click();
+document.getElementById('importFile').onchange=async(ev)=>{
+  const f=ev.target.files[0];if(!f)return;
+  showOverlay('Importing '+f.name+'…','Parsing on your machine — nothing is uploaded.');
+  try{
+    const buf=await f.arrayBuffer();
+    const r=await fetch('/api/import_resume?filename='+encodeURIComponent(f.name),
+      {method:'POST',body:buf});
+    const j=await r.json();
+    if(!r.ok||!j.ok){toast(j.error||'Import failed','err');return;}
+    if(!(j.text||'').trim()){toast('No text found — is this a scanned/image PDF?','err');return;}
+    document.getElementById('pResume').value=j.text;
+    toast('Imported '+j.chars+' characters. Review, then Save profile.','ok');
+  }catch(e){toast('Import failed: '+e.message,'err');}
+  finally{hideOverlay();ev.target.value='';}
+};
+
 async function loadSettings(){
   const c=await api('/api/config');
   cOllamaUrl.value=c.ollama_url;cOllamaModel.value=c.ollama_model;
@@ -1290,7 +1553,7 @@ async function loadAudit(){
       <td class="muted">${r.detail||''}</td>`;b.appendChild(tr);});
 }
 
-refreshOllama();loadJobs();loadProfile();loadSettings();
+refreshOllama();loadJobs();loadProfile();loadSettings();loadSetup();
 setInterval(refreshOllama,15000);
 </script>
 </body></html>"""
@@ -1311,6 +1574,30 @@ def index():
 @app.get("/api/ollama")
 def api_ollama():
     return ollama_status(load_config())
+
+
+@app.post("/api/ollama/install")
+def api_ollama_install():
+    # Explicit, user-confirmed action in the GUI. Linux only.
+    return ollama_install()
+
+
+@app.post("/api/ollama/pull")
+async def api_ollama_pull(request: Request):
+    data = await request.json()
+    return ollama_pull(load_config(), data.get("model", ""))
+
+
+@app.post("/api/import_resume")
+async def api_import_resume(request: Request, filename: str = Query("resume.txt")):
+    data = await request.body()
+    if not data:
+        return JSONResponse({"ok": False, "error": "Empty file."}, status_code=400)
+    text, err = extract_resume_text(filename, data)
+    if err:
+        return JSONResponse({"ok": False, "error": err}, status_code=400)
+    audit("import_resume", "{} ({} chars)".format(filename, len(text or "")))
+    return {"ok": True, "text": text, "chars": len(text or ""), "filename": filename}
 
 
 @app.get("/api/profile")

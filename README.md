@@ -6,7 +6,7 @@ RJH is an ethical, open-source, local-first job-application copilot. Everything 
 
 **Status:** early but working MVP. Runs offline out of the box via a demo source so you can try the full workflow before wiring real feeds.
 
-**License:** MIT.
+**License:** GNU GPLv3.
 
 ## Why this exists
 
@@ -44,11 +44,24 @@ python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 # for the pre-fill step:
 playwright install chromium
-# local LLM: install Ollama from https://ollama.com, then:
-ollama pull mistral
 ```
 
-A multilingual-capable model is recommended, since many European postings are not in English.
+`requirements.txt` pins three required packages (fastapi, uvicorn, requests). The rest are optional and only loaded when the matching feature is used:
+
+- `playwright` — the browser pre-fill step.
+- `pypdf` / `odfpy` — importing a resume from a PDF or ODT file (parsed locally).
+
+The app starts and runs fully without any of the optional packages; each feature shows a clear hint if its dependency is missing.
+
+### Local model (Ollama)
+
+You do not need Ollama installed to launch RJH. Open the **Settings → Setup** panel and the app will:
+
+- detect whether the Ollama engine is installed and running, and show its version;
+- offer a one-click **Install Ollama** button (Linux) that runs the official installer after you confirm — it downloads only the engine, never your data;
+- list the models you already have and let you **pull** new ones (e.g. `mistral`) and pick the active one.
+
+On non-Linux systems, install Ollama manually from https://ollama.com/download; model management still works from the panel. A multilingual-capable model is recommended, since many European postings are not in English.
 
 ## Run
 
@@ -66,7 +79,7 @@ Sources: add any RSS/Atom feed; set enabled true and a real URL.
 
 Pre-fill site rules: explicit CSS-selector rules per site, applied first; a multilingual generic fallback (English, French, German, Dutch, Nordic) fills the rest by reading each field's name, id, placeholder, aria-label, autocomplete, and label text. Adding a site needs no code change.
 
-Profile: fill in your master profile, keywords (which drive scoring), and optional absolute paths to a curated resume/cover-letter PDF, which are attached during pre-fill in preference to the generated text.
+Profile: fill in your master profile, keywords (which drive scoring), and optional absolute paths to a curated resume/cover-letter PDF, which are attached during pre-fill in preference to the generated text. You can also **Import resume…** from a PDF, ODT, TXT, or Markdown file — the text is extracted locally into the master-resume box for you to review before saving.
 
 ## Roadmap
 
@@ -81,4 +94,4 @@ Issues and pull requests welcome. Two hard rules: keep the human-in-the-loop sub
 
 ## Disclaimer
 
-Provided as-is under the MIT license, with no warranty. You are responsible for complying with the Terms of Service of any site you point it at and with applicable data-protection law.
+Provided as-is under the GNU General Public License v3.0, with no warranty. You are responsible for complying with the Terms of Service of any site you point it at and with applicable data-protection law.

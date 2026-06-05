@@ -12,4 +12,4 @@ Reverse Job Hunting. Software for people who are tired of shouting into the void
 
 5. Good citizen of the web. Respect robots.txt. Rate-limit. Prefer official feeds and public pages. Never defeat anti-bot measures. Being effective is not a license to be extractive.
 
-6. Open and auditable. Open source, MIT-licensed, with a full audit trail of every action the tool takes, so anyone can see exactly what it did and why.
+6. Open and auditable. Open source, GPLv3-licensed, with a full audit trail of every action the tool takes, so anyone can see exactly what it did and why.
