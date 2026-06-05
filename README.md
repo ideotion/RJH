@@ -78,9 +78,14 @@ Open the printed URL (default http://127.0.0.1:8765). Your database and audit tr
 
 Everything is editable from the Settings tab and persisted to rjh_data/config.json.
 
-Sources: three adapter types, all config-driven. `demo` is the bundled offline sample. `rss` reads any RSS/Atom feed. `json_api` reads any JSON jobs API — point `url` at the endpoint, set `root` to the key holding the list, and optionally `map` your fields onto ours (`title`, `company`, `location`, `url`, `description`, `posted_at`, `salary`). A ready-to-run example, **Arbeitnow** (a free, no-auth European job-board API), ships disabled; flip `enabled` to `true` to use it. **EURES** (https://eures.europa.eu), the official EU portal, remains the recommended primary source — paste an official EURES/national-PES feed URL and enable it. Network sources ship disabled so nothing is fetched until you opt in.
+Sources: three adapter types, all config-driven. `demo` is the bundled offline sample. `rss` reads any RSS/Atom feed. `json_api` reads any JSON jobs API — point `url` at the endpoint, set `root` to the key holding the list, and `map` your fields onto ours (`title`, `company`, `location`, `url`, `description`, `posted_at`, `salary`); map values may be **dotted paths** for nested JSON (e.g. `employer.name`, `description.text`). Two real, no-auth sources ship pre-configured but **disabled**:
 
-Import jobs: don't want to configure a feed yet? Click **Import jobs…** on the Jobs tab to load listings from a **CSV or JSON** file. Column/key names are matched flexibly (e.g. `Job Title`, `job_title`, `position` all map to the title), each row is de-duplicated and enriched (salary + competencies) just like collected jobs.
+- **Arbetsförmedlingen / JobTech** — Sweden's Public Employment Service open API (`jobsearch.api.jobtechdev.se`). A genuine national-PES feed; flip `enabled` to `true`.
+- **Arbeitnow** — a free European job-board API.
+
+**EURES** (https://eures.europa.eu), the official EU portal, remains the recommended primary source — paste an official EURES/national-PES feed URL and enable it. All network sources ship disabled so nothing is fetched until you opt in; every fetch still honours robots.txt and per-domain rate limits.
+
+Import jobs: don't want to configure a feed yet? Click **Import jobs…** on the Jobs tab to load listings from a **CSV or JSON** file, or grab a **CSV template** / **JSON template** (the buttons next to it) to see the exact columns. Column/key names are matched flexibly (e.g. `Job Title`, `job_title`, `position` all map to the title); each row is de-duplicated and enriched (salary + competencies) just like collected jobs.
 
 AI document tools: off-by-default-friendly. The **Enable AI document tools** checkbox in Settings turns the optional Ollama layer on or off. With it off, the Documents tab and the per-job Generate buttons disappear and the rest of the app is unaffected. After enabling, use **Settings → Setup** to install Ollama and pull a model.
 
@@ -92,7 +97,7 @@ Profile: fill in your master profile, keywords (which drive scoring), and option
 
 ## Roadmap
 
-- More worked source adapters (an official EURES/national-PES feed once a stable public URL is settled on).
+- More worked source adapters (additional national-PES APIs; an official EURES feed once a stable public URL is settled on).
 - A selector-capture helper to build site rules faster.
 - Optional semantic matching and richer scoring.
 - Local-LLM translation and summarization of postings.

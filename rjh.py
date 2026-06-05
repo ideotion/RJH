@@ -138,6 +138,27 @@ DEFAULT_CONFIG = {
             "default_country": "EU"
         },
         {
+            # Sweden's Public Employment Service (Arbetsförmedlingen) open
+            # JobTech API. Free, no key. Nested fields use dotted paths.
+            # Empty q returns the most recent ads; tune q/limit in the URL.
+            "name": "Arbetsformedlingen / JobTech (Swedish PES)",
+            "type": "json_api",
+            "enabled": False,
+            "url": "https://jobsearch.api.jobtechdev.se/search?q=&limit=50",
+            "root": "hits",
+            "map": {
+                "title": "headline",
+                "company": "employer.name",
+                "location": "workplace_address.municipality",
+                "country": "workplace_address.country",
+                "url": "webpage_url",
+                "description": "description.text",
+                "posted_at": "publication_date",
+                "salary": "salary_description"
+            },
+            "default_country": "SE"
+        },
+        {
             "name": "Arbeitnow (EU job board API)",
             "type": "json_api",
             "enabled": False,
@@ -507,9 +528,12 @@ def _dig(obj, path):
 
 
 def _json_first(item, names):
+    """Return the first non-empty value among candidate keys. A name containing
+    a dot is treated as a nested path (e.g. "employer.name")."""
     for n in names:
-        if n in item and item[n] not in (None, ""):
-            return item[n]
+        v = _dig(item, n) if "." in n else item.get(n)
+        if v not in (None, ""):
+            return v
     return ""
 
 
@@ -1129,6 +1153,37 @@ def import_jobs(jobs, cfg, source_label):
     return {"ok": True, "added": added, "skipped": skipped, "total": len(jobs)}
 
 
+# Canonical columns for the import template. `url` is required; the rest are
+# optional. Header names are matched flexibly on import (see _JOB_FIELD_ALIASES).
+_TEMPLATE_COLUMNS = ["title", "company", "location", "country", "url",
+                     "description", "posted_at", "salary"]
+_TEMPLATE_ROWS = [
+    {"title": "Senior Software Engineer", "company": "Acme BV",
+     "location": "Amsterdam", "country": "NL",
+     "url": "https://example.org/jobs/123",
+     "description": "Build and operate Python services on AWS. Kubernetes a plus.",
+     "posted_at": "2026-06-05", "salary": "EUR 70,000-90,000"},
+    {"title": "Regulatory Affairs Manager", "company": "Helsinki Therapeutics",
+     "location": "Helsinki", "country": "FI",
+     "url": "https://example.org/jobs/456",
+     "description": "Own EMA filings for pediatric pharma. English required.",
+     "posted_at": "2026-06-04", "salary": "95k-115k EUR"},
+]
+
+
+def build_import_template(fmt):
+    """Return (content, media_type, filename) for a CSV or JSON import sample."""
+    if fmt == "json":
+        return (json.dumps(_TEMPLATE_ROWS, indent=2, ensure_ascii=False),
+                "application/json", "rjh_import_template.json")
+    buf = StringIO()
+    writer = csv.DictWriter(buf, fieldnames=_TEMPLATE_COLUMNS)
+    writer.writeheader()
+    for row in _TEMPLATE_ROWS:
+        writer.writerow(row)
+    return buf.getvalue(), "text/csv", "rjh_import_template.csv"
+
+
 # --------------------------------------------------------------------------- #
 # Per-site pre-fill engine (two layers; NEVER submits)
 # --------------------------------------------------------------------------- #
@@ -1532,6 +1587,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button class="btn sec" id="rescoreBtn" title="Recompute score, salary and competencies for all stored jobs">Re-score all</button>
       <input type="file" id="importJobsFile" accept=".csv,.json,.tsv" class="hide"/>
       <button class="btn sec" id="importJobsBtn" title="Import job listings from a CSV or JSON file">Import jobs…</button>
+      <a class="btn sec" href="/api/import_template?format=csv" title="Download a sample CSV showing the expected columns">CSV template</a>
+      <a class="btn sec" href="/api/import_template?format=json" title="Download a sample JSON file">JSON template</a>
       <a class="btn sec" href="/api/export?format=csv">Export CSV</a>
       <a class="btn sec" href="/api/export?format=json">Export JSON</a>
     </div>
@@ -2114,6 +2171,15 @@ async def api_import_jobs(request: Request,
                             status_code=400)
     result = import_jobs(jobs, load_config(), source)
     return result
+
+
+@app.get("/api/import_template")
+def api_import_template(format: str = "csv"):
+    content, media, filename = build_import_template(
+        "json" if format == "json" else "csv")
+    return PlainTextResponse(
+        content, media_type=media,
+        headers={"Content-Disposition": "attachment; filename=" + filename})
 
 
 @app.get("/api/profile")
