@@ -20,10 +20,13 @@ The principles RJH is built on live in [MANIFESTO.md](MANIFESTO.md).
 
 1. Collects job postings from config-driven source adapters (any RSS or Atom feed), respecting robots.txt and per-domain rate limits.
 2. Stores them in a searchable local SQLite database with duplicate detection (URL canonicalization plus content hashing).
-3. Scores each posting against your master profile so the best fits surface first.
-4. Generates a tailored resume and cover letter per role using your local Ollama model, grounded only in your real master resume.
-5. Pre-fills the application form in a real browser using a per-site field-mapping system, then stops. You review, edit, and submit yourself.
-6. Logs every action to the database and to a dated Markdown audit trail.
+3. Enriches each posting locally: scores it against your master profile, parses a salary range from the text, and extracts competency tags — no AI required.
+4. Lets you full-text search across title, company, location, country, salary, competencies and description, and sort by any column (score, title, company, location, salary, competencies, status) just by clicking the header.
+5. *(Optional add-on)* Generates a tailored resume and cover letter per role using your local Ollama model, grounded only in your real master resume.
+6. Pre-fills the application form in a real browser using a per-site field-mapping system, then stops. You review, edit, and submit yourself.
+7. Logs every action to the database and to a dated Markdown audit trail.
+
+The scraper, database, search, sort, scoring, profile, resume import, export and browser pre-fill form the **core** and run with no AI at all. The LLM document tools are an **optional add-on**, toggled in Settings; everything else keeps working when it is off.
 
 Tuned for Western and Northern Europe. EURES (https://eures.europa.eu), the official EU job-mobility portal, is the recommended primary source; national public-employment-service feeds and company career-page feeds plug in the same way.
 
@@ -76,6 +79,10 @@ Open the printed URL (default http://127.0.0.1:8765). Your database and audit tr
 Everything is editable from the Settings tab and persisted to rjh_data/config.json.
 
 Sources: add any RSS/Atom feed; set enabled true and a real URL.
+
+AI document tools: off-by-default-friendly. The **Enable AI document tools** checkbox in Settings turns the optional Ollama layer on or off. With it off, the Documents tab and the per-job Generate buttons disappear and the rest of the app is unaffected. After enabling, use **Settings → Setup** to install Ollama and pull a model.
+
+Browsing jobs: click any column header to sort (click again to reverse); the search box matches every field including salary and competencies; **Re-score all** recomputes score, salary and competencies for stored jobs after you change your profile.
 
 Pre-fill site rules: explicit CSS-selector rules per site, applied first; a multilingual generic fallback (English, French, German, Dutch, Nordic) fills the rest by reading each field's name, id, placeholder, aria-label, autocomplete, and label text. Adding a site needs no code change.
 
