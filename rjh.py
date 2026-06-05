@@ -30,10 +30,13 @@ ETHICS (non-negotiable, baked in)
     and risks account bans; this tool deliberately does not do that.
 
 INSTALL
+  # one-liner (clones the repo, sets up a venv, installs core deps):
+  curl -fsSL https://raw.githubusercontent.com/ideotion/RJH/main/install.sh | sh
+  # ...or manually:
   python3 -m venv venv && source venv/bin/activate
   pip install fastapi uvicorn requests
-  # optional, only for the form pre-fill assistant:
-  pip install playwright && playwright install chromium
+  # optional, only for the form pre-fill assistant (Firefox by default):
+  pip install playwright && playwright install firefox
   # optional, only for importing PDF/ODT resumes:
   pip install pypdf odfpy
   # local LLM: install/manage Ollama and models from the Settings -> Setup tab
@@ -115,6 +118,9 @@ DEFAULT_CONFIG = {
     # AI document tools (Ollama) are an OPTIONAL add-on. The scraper, database,
     # search/sort, profile and pre-fill all work with this off.
     "llm_enabled": True,
+    # Browser engine for the optional pre-fill step: firefox, chromium or webkit.
+    # Install the chosen one with `playwright install <engine>`.
+    "browser": "firefox",
     "rate_limit_seconds": 5,            # minimum seconds between hits to one domain
     "request_timeout": 20,
     # Country preference for Western & Northern Europe. ISO-2 codes, ordered.
@@ -1297,10 +1303,17 @@ def prefill_application(job_id, job_url, cfg):
     if not PLAYWRIGHT_AVAILABLE:
         return {"ok": False,
                 "msg": "Playwright not installed. Run: pip install playwright "
-                       "&& playwright install chromium",
+                       "&& playwright install firefox",
                 "report": []}
 
     from playwright.sync_api import sync_playwright
+
+    # Which browser engine to drive: firefox, chromium or webkit. All are
+    # supported by Playwright; install the chosen one with `playwright install
+    # <engine>`. Defaults to firefox.
+    engine = (cfg.get("browser") or "firefox").strip().lower()
+    if engine not in ("firefox", "chromium", "webkit"):
+        engine = "firefox"
 
     profile = get_profile()
     docs = get_documents(job_id)
@@ -1313,7 +1326,13 @@ def prefill_application(job_id, job_url, cfg):
 
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=False)
+            try:
+                browser = getattr(pw, engine).launch(headless=False)
+            except Exception as e:
+                return {"ok": False,
+                        "msg": "Could not launch {0}. Install it with: "
+                               "playwright install {0}  ({1})".format(engine, e),
+                        "report": []}
             page = browser.new_page(user_agent=USER_AGENT)
             page.goto(job_url, wait_until="domcontentloaded")
 
@@ -1716,6 +1735,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div><label>Request timeout (s)</label><input id="cTimeout" type="number" style="width:100%"/></div>
       <div><label>Preferred countries (ISO-2, ordered)</label><input id="cCountries" style="width:100%"/></div>
     </div>
+    <div class="grid3" style="margin-top:8px">
+      <div><label>Pre-fill browser</label>
+        <select id="cBrowser" style="width:100%">
+          <option value="firefox">Firefox</option>
+          <option value="chromium">Chromium</option>
+          <option value="webkit">WebKit</option>
+        </select></div>
+    </div>
+    <div class="hint">The pre-fill step drives this browser engine. Install it once with
+      <code>playwright install firefox</code> (or chromium / webkit).</div>
   </div>
   <div class="card">
     <div class="group-title">Sources (JSON)</div>
@@ -2078,6 +2107,7 @@ async function loadSettings(){
   cLang.value=c.output_language;cRate.value=c.rate_limit_seconds;
   cTimeout.value=c.request_timeout;
   cCountries.value=(c.preferred_countries||[]).join(', ');
+  document.getElementById('cBrowser').value=c.browser||'firefox';
   cSources.value=JSON.stringify(c.sources,null,2);
   cMappings.value=JSON.stringify(c.site_mappings,null,2);
   document.getElementById('cLlmEnabled').checked=c.llm_enabled!==false;
@@ -2092,6 +2122,7 @@ document.getElementById('saveSettings').onclick=async()=>{
     output_language:cLang.value,rate_limit_seconds:Number(cRate.value),
     request_timeout:Number(cTimeout.value),
     llm_enabled:document.getElementById('cLlmEnabled').checked,
+    browser:document.getElementById('cBrowser').value,
     preferred_countries:cCountries.value.split(',').map(s=>s.trim()).filter(Boolean),
     sources,site_mappings:mappings};
   await api('/api/config',{method:'POST',headers:{'content-type':'application/json'},
