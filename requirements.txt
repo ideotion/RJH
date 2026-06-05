@@ -1,10 +1,9 @@
-# Core dependencies — required to run RJH.
-fastapi
-uvicorn
-requests
-
-# Optional extras. Uncomment a line (or `pip install` it) only if you want that
-# feature; RJH runs fully without them.
+# RJH's core has NO required third-party dependencies — it runs on the Python
+# standard library alone, so it installs and works fully offline. There is
+# nothing to install here for the app to run.
+#
+# Optional extras. Install one only if you want that feature (each needs network
+# once); RJH runs fully without them.
 #
 # Browser pre-fill assistant. After installing, fetch a browser engine with:
 #   playwright install firefox      (or: chromium / webkit)

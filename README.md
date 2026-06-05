@@ -42,22 +42,26 @@ Auto-submitting to sites such as LinkedIn or Indeed violates their Terms of Serv
 
 ## Install
 
-One line — clones the repo, creates a virtualenv, installs the core dependencies, then **starts RJH and opens it in your browser** automatically:
+**The core has zero third-party dependencies** — it runs on the Python standard library alone (Python 3.8+), so it installs and works **fully offline**. No `pip`, no network.
+
+One line — clones the repo, then **starts RJH and opens it in your browser** automatically:
 
 ```
 curl -fsSL https://raw.githubusercontent.com/ideotion/RJH/main/install.sh | sh
 ```
 
-The installer is a short, readable, GPLv3 shell script ([install.sh](install.sh)). Set `RJH_DIR=/path` to choose where it goes (default `~/rjh`), or `RJH_NO_START=1` to install without launching. To run it again later: `cd ~/rjh && ./venv/bin/python rjh.py`.
+The installer is a short, readable, GPLv3 shell script ([install.sh](install.sh)). Set `RJH_DIR=/path` to choose where it goes (default `~/rjh`), or `RJH_NO_START=1` to install without launching. To run again later: `cd ~/rjh && ./venv/bin/python rjh.py`.
 
-Or do it by hand:
+Or just clone and run — nothing to install:
 
 ```
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+git clone https://github.com/ideotion/RJH.git && cd RJH
+python3 rjh.py
 ```
 
-`requirements.txt` pins three required packages (fastapi, uvicorn, requests). The rest are optional and only loaded when the matching feature is used:
+### Optional extras
+
+Each is opt-in and only needed for its feature; the app runs fully without them (installing them needs network once):
 
 - `playwright` — the browser pre-fill step. After `pip install playwright`, fetch an engine with `playwright install firefox` (Firefox is the default; `chromium` and `webkit` also work, selectable in Settings).
 - `pypdf` / `odfpy` — importing a resume from a PDF or ODT file (parsed locally).
