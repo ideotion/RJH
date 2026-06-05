@@ -4,3 +4,6 @@ requests
 # Optional: only needed for the browser pre-fill step.
 # After installing, run:  playwright install chromium
 playwright
+# Optional: only needed to import PDF / ODT resumes (parsed locally).
+pypdf
+odfpy
