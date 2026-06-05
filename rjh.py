@@ -30,21 +30,19 @@ ETHICS (non-negotiable, baked in)
     and risks account bans; this tool deliberately does not do that.
 
 INSTALL
-  # one-liner (clones the repo, sets up a venv, installs core deps):
+  # The core needs NO third-party packages — just Python 3.8+. It installs and
+  # runs fully offline. One-liner (clones the repo and launches):
   curl -fsSL https://raw.githubusercontent.com/ideotion/RJH/main/install.sh | sh
-  # ...or manually:
-  python3 -m venv venv && source venv/bin/activate
-  pip install fastapi uvicorn requests
-  # optional, only for the form pre-fill assistant (Firefox by default):
-  pip install playwright && playwright install firefox
-  # optional, only for importing PDF/ODT resumes:
-  pip install pypdf odfpy
-  # local LLM: install/manage Ollama and models from the Settings -> Setup tab
-  # in the GUI, or manually from https://ollama.com (then:  ollama pull mistral)
+  # ...or just: python3 rjh.py
+  #
+  # Optional extras (only if you want them; each needs network to install once):
+  #   pip install playwright && playwright install firefox   # form pre-fill
+  #   pip install pypdf odfpy                                 # PDF/ODT resume import
+  #   Ollama for local AI drafting — install/manage from Settings -> Setup
 
 RUN
   python3 rjh.py
-  # then open the printed URL (default http://127.0.0.1:8765) in your browser.
+  # opens your browser at the printed URL (default http://127.0.0.1:8765).
 """
 
 import os
@@ -62,18 +60,16 @@ import threading
 import subprocess
 import datetime as dt
 from io import StringIO, BytesIO
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from urllib.parse import (urlparse, urlunparse, parse_qsl, parse_qs, urlencode)
 from urllib import robotparser
+import urllib.request
+import urllib.error
+import http.server
 from xml.etree import ElementTree as ET
 
-import requests
-
-try:
-    from fastapi import FastAPI, Request, Query
-    from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
-    import uvicorn
-except ImportError:
-    raise SystemExit("Missing dependencies. Run:  pip install fastapi uvicorn requests")
+# RJH runs on the Python standard library ALONE — no third-party packages — so
+# it installs and runs fully offline. The small HTTP client and web layer defined
+# below stand in for what used to be the `requests` and FastAPI/uvicorn packages.
 
 # Optional dependencies. Each is guarded so the app runs fully without it, and
 # the guards catch BaseException (not just ImportError): a broken optional dep —
@@ -96,6 +92,74 @@ try:
     ODFPY_AVAILABLE = True
 except BaseException:
     ODFPY_AVAILABLE = False
+
+
+# --------------------------------------------------------------------------- #
+# Minimal HTTP client (stdlib) — a tiny `requests`-compatible shim
+# --------------------------------------------------------------------------- #
+
+class _HTTPError(Exception):
+    pass
+
+
+class _ConnectionError(Exception):
+    pass
+
+
+class _HTTPResponse:
+    def __init__(self, status_code, content, headers):
+        self.status_code = status_code
+        self.content = content
+        self.headers = headers or {}
+
+    @property
+    def text(self):
+        return self.content.decode("utf-8", "replace")
+
+    def json(self):
+        return json.loads(self.text)
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise _HTTPError("HTTP {}".format(self.status_code))
+
+
+def _http_request(method, url, json_body=None, headers=None, timeout=20):
+    h = dict(headers or {})
+    data = None
+    if json_body is not None:
+        data = json.dumps(json_body).encode("utf-8")
+        h.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return _HTTPResponse(getattr(resp, "status", 200), resp.read(),
+                                 dict(resp.headers))
+    except urllib.error.HTTPError as e:
+        return _HTTPResponse(e.code, e.read() or b"", dict(e.headers or {}))
+    except (urllib.error.URLError, OSError) as e:
+        raise _ConnectionError(str(e))
+
+
+class _RequestsShim:
+    """The handful of `requests` features RJH uses, on top of urllib."""
+    HTTPError = _HTTPError
+
+    class exceptions:
+        ConnectionError = _ConnectionError
+        HTTPError = _HTTPError
+
+    @staticmethod
+    def get(url, headers=None, timeout=20, **kw):
+        return _http_request("GET", url, headers=headers, timeout=timeout)
+
+    @staticmethod
+    def post(url, json=None, headers=None, timeout=20, **kw):
+        return _http_request("POST", url, json_body=json, headers=headers,
+                             timeout=timeout)
+
+
+requests = _RequestsShim()
 
 
 # --------------------------------------------------------------------------- #
@@ -2149,37 +2213,118 @@ async function loadAudit(){
 
 
 # --------------------------------------------------------------------------- #
-# FastAPI app
+# Minimal web layer (stdlib http.server) — stands in for FastAPI/uvicorn
 # --------------------------------------------------------------------------- #
 
-app = FastAPI(title="RJH — Reverse Job Hunting")
+class Response:
+    def __init__(self, body=b"", status_code=200,
+                 media_type="application/json; charset=utf-8", headers=None):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.body = body
+        self.status_code = status_code
+        self.media_type = media_type
+        self.headers = headers or {}
 
 
-@app.get("/", response_class=HTMLResponse)
-def index():
-    return INDEX_HTML
+def JSONResponse(content, status_code=200, headers=None):
+    return Response(json.dumps(content), status_code,
+                    "application/json; charset=utf-8", headers)
+
+
+def HTMLResponse(content, status_code=200, headers=None):
+    return Response(content, status_code, "text/html; charset=utf-8", headers)
+
+
+def PlainTextResponse(content, status_code=200, media_type="text/plain",
+                      headers=None):
+    if "charset" not in media_type:
+        media_type = media_type + "; charset=utf-8"
+    return Response(content, status_code, media_type, headers)
+
+
+class Req:
+    """What a route handler receives: path params, query string, and body."""
+    def __init__(self, path_params, query, raw_body):
+        self.path_params = path_params
+        self.query = query           # dict[str, str]
+        self._body = raw_body        # bytes
+
+    def body(self):
+        return self._body
+
+    def json(self):
+        if not self._body:
+            return {}
+        return json.loads(self._body.decode("utf-8", "replace"))
+
+    def q(self, name, default=""):
+        return self.query.get(name, default)
+
+    def int_path(self, name):
+        return int(self.path_params[name])
+
+
+class App:
+    """Tiny router: @app.get / @app.post with {param} path segments."""
+    def __init__(self):
+        self._routes = []            # list of (method, compiled_regex, func)
+
+    def _add(self, method, path):
+        pattern = re.sub(r"\{(\w+)\}", r"(?P<\1>[^/]+)", path)
+        rx = re.compile("^" + pattern + "$")
+
+        def deco(fn):
+            self._routes.append((method, rx, fn))
+            return fn
+        return deco
+
+    def get(self, path, **kw):
+        return self._add("GET", path)
+
+    def post(self, path, **kw):
+        return self._add("POST", path)
+
+    def handle(self, method, path, query, body):
+        for m, rx, fn in self._routes:
+            if m != method:
+                continue
+            mt = rx.match(path)
+            if mt:
+                result = fn(Req(mt.groupdict(), query, body))
+                return result if isinstance(result, Response) else JSONResponse(result)
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+
+app = App()
+
+
+@app.get("/")
+def index(req):
+    return HTMLResponse(INDEX_HTML)
 
 
 @app.get("/api/ollama")
-def api_ollama():
+def api_ollama(req):
     return ollama_status(load_config())
 
 
 @app.post("/api/ollama/install")
-def api_ollama_install():
+def api_ollama_install(req):
     # Explicit, user-confirmed action in the GUI. Linux only.
     return ollama_install()
 
 
 @app.post("/api/ollama/pull")
-async def api_ollama_pull(request: Request):
-    data = await request.json()
+def api_ollama_pull(req):
+    data = req.json()
     return ollama_pull(load_config(), data.get("model", ""))
 
 
 @app.post("/api/import_resume")
-async def api_import_resume(request: Request, filename: str = Query("resume.txt")):
-    data = await request.body()
+def api_import_resume(req):
+    filename = req.q("filename", "resume.txt")
+    data = req.body()
     if not data:
         return JSONResponse({"ok": False, "error": "Empty file."}, status_code=400)
     text, err = extract_resume_text(filename, data)
@@ -2190,10 +2335,10 @@ async def api_import_resume(request: Request, filename: str = Query("resume.txt"
 
 
 @app.post("/api/import_jobs")
-async def api_import_jobs(request: Request,
-                         filename: str = Query("jobs.csv"),
-                         source: str = Query("File import")):
-    data = await request.body()
+def api_import_jobs(req):
+    filename = req.q("filename", "jobs.csv")
+    source = req.q("source", "File import")
+    data = req.body()
     if not data:
         return JSONResponse({"ok": False, "error": "Empty file."}, status_code=400)
     jobs, err = parse_jobs_file(filename, data)
@@ -2202,53 +2347,51 @@ async def api_import_jobs(request: Request,
     if not jobs:
         return JSONResponse({"ok": False, "error": "No rows found in the file."},
                             status_code=400)
-    result = import_jobs(jobs, load_config(), source)
-    return result
+    return import_jobs(jobs, load_config(), source)
 
 
 @app.get("/api/import_template")
-def api_import_template(format: str = "csv"):
+def api_import_template(req):
+    fmt = req.q("format", "csv")
     content, media, filename = build_import_template(
-        "json" if format == "json" else "csv")
+        "json" if fmt == "json" else "csv")
     return PlainTextResponse(
         content, media_type=media,
         headers={"Content-Disposition": "attachment; filename=" + filename})
 
 
 @app.get("/api/profile")
-def api_get_profile():
+def api_get_profile(req):
     return get_profile()
 
 
 @app.post("/api/profile")
-async def api_set_profile(request: Request):
-    data = await request.json()
-    set_profile(data)
+def api_set_profile(req):
+    set_profile(req.json())
     return {"ok": True}
 
 
 @app.get("/api/config")
-def api_get_config():
+def api_get_config(req):
     return load_config()
 
 
 @app.post("/api/config")
-async def api_set_config(request: Request):
+def api_set_config(req):
     cfg = load_config()
-    incoming = await request.json()
-    cfg.update(incoming)
+    cfg.update(req.json())
     save_config(cfg)
     audit("config_updated", "")
     return {"ok": True}
 
 
 @app.post("/api/collect")
-def api_collect():
+def api_collect(req):
     return collect_all(load_config())
 
 
 @app.get("/api/stats")
-def api_stats():
+def api_stats(req):
     with db() as conn:
         total = conn.execute("SELECT COUNT(*) AS c FROM jobs").fetchone()["c"]
         by_status = {r["status"]: r["c"] for r in conn.execute(
@@ -2276,8 +2419,15 @@ _SORT_COLUMNS = {
 
 
 @app.get("/api/jobs")
-def api_jobs(q: str = "", status: str = "", min_score: int = 0,
-            sort: str = "score", dir: str = "desc"):
+def api_jobs(req):
+    q = req.q("q")
+    status = req.q("status")
+    try:
+        min_score = int(req.q("min_score", "0") or 0)
+    except ValueError:
+        min_score = 0
+    sort = req.q("sort", "score")
+    direction_in = req.q("dir", "desc")
     sql = "SELECT * FROM jobs WHERE score >= ?"
     params = [min_score]
     if status:
@@ -2290,7 +2440,7 @@ def api_jobs(q: str = "", status: str = "", min_score: int = 0,
         sql += " AND (" + " OR ".join(f + " LIKE ?" for f in fields) + ")"
         params += ["%" + q + "%"] * len(fields)
     col = _SORT_COLUMNS.get(sort, "score")
-    direction = "ASC" if str(dir).lower() == "asc" else "DESC"
+    direction = "ASC" if str(direction_in).lower() == "asc" else "DESC"
     order = col + " " + direction
     if sort == "salary":
         # always push unknown salaries to the bottom, regardless of direction
@@ -2302,7 +2452,7 @@ def api_jobs(q: str = "", status: str = "", min_score: int = 0,
 
 
 @app.post("/api/rescore")
-def api_rescore():
+def api_rescore(req):
     """Recompute score, salary, and competencies for every stored job against
     the current profile/config. Pure local computation; touches no network."""
     cfg = load_config()
@@ -2324,8 +2474,9 @@ def api_rescore():
 
 
 @app.post("/api/jobs/{job_id}/status")
-async def api_status(job_id: int, request: Request):
-    data = await request.json()
+def api_status(req):
+    job_id = req.int_path("job_id")
+    data = req.json()
     with _db_lock, db() as conn:
         conn.execute("UPDATE jobs SET status = ? WHERE id = ?",
                      (data.get("status", "new"), job_id))
@@ -2334,7 +2485,8 @@ async def api_status(job_id: int, request: Request):
 
 
 @app.post("/api/generate/{job_id}")
-def api_generate(job_id: int):
+def api_generate(req):
+    job_id = req.int_path("job_id")
     cfg = load_config()
     if not cfg.get("llm_enabled", True):
         return JSONResponse(
@@ -2350,15 +2502,16 @@ def api_generate(job_id: int):
 
 
 @app.get("/api/documents/{job_id}")
-def api_get_documents(job_id: int):
-    docs = get_documents(job_id)
+def api_get_documents(req):
+    docs = get_documents(req.int_path("job_id"))
     return {"resume": docs.get("resume", ""),
             "cover_letter": docs.get("cover_letter", "")}
 
 
 @app.post("/api/documents/{job_id}")
-async def api_save_documents(job_id: int, request: Request):
-    data = await request.json()
+def api_save_documents(req):
+    job_id = req.int_path("job_id")
+    data = req.json()
     now = dt.datetime.now().isoformat(timespec="seconds")
     with _db_lock, db() as conn:
         if not conn.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone():
@@ -2375,7 +2528,8 @@ async def api_save_documents(job_id: int, request: Request):
 
 
 @app.post("/api/prefill/{job_id}")
-def api_prefill(job_id: int):
+def api_prefill(req):
+    job_id = req.int_path("job_id")
     cfg = load_config()
     with db() as conn:
         row = conn.execute("SELECT id, url FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -2386,7 +2540,7 @@ def api_prefill(job_id: int):
 
 
 @app.get("/api/audit")
-def api_audit():
+def api_audit(req):
     with db() as conn:
         rows = conn.execute(
             "SELECT ts, action, detail FROM audit ORDER BY id DESC LIMIT 300").fetchall()
@@ -2394,11 +2548,12 @@ def api_audit():
 
 
 @app.get("/api/export")
-def api_export(format: str = Query("csv")):
+def api_export(req):
+    fmt = req.q("format", "csv")
     with db() as conn:
         rows = [dict(r) for r in conn.execute(
             "SELECT * FROM jobs ORDER BY score DESC").fetchall()]
-    if format == "json":
+    if fmt == "json":
         return JSONResponse(rows, headers={
             "Content-Disposition": "attachment; filename=jobs.json"})
     buf = StringIO()
@@ -2413,6 +2568,46 @@ def api_export(format: str = Query("csv")):
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
+
+def serve(application, host, port):
+    """Threaded stdlib HTTP server that drives the App router."""
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _dispatch(self, method):
+            parsed = urlparse(self.path)
+            query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length) if length else b""
+            try:
+                resp = application.handle(method, parsed.path, query, body)
+            except Exception as e:               # never drop the connection
+                resp = JSONResponse({"error": str(e)}, status_code=500)
+            self.send_response(resp.status_code)
+            self.send_header("Content-Type", resp.media_type)
+            self.send_header("Content-Length", str(len(resp.body)))
+            for k, v in resp.headers.items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(resp.body)
+
+        def do_GET(self):
+            self._dispatch("GET")
+
+        def do_POST(self):
+            self._dispatch("POST")
+
+        def log_message(self, *a):
+            pass                                  # keep the console quiet
+
+    httpd = http.server.ThreadingHTTPServer((host, port), Handler)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  Stopping RJH. Bye.")
+    finally:
+        httpd.server_close()
+
 
 def _open_browser_when_ready(url, host, port):
     """Wait for the server to accept connections, then open the default browser
@@ -2457,7 +2652,7 @@ def main():
     if not no_browser:
         threading.Thread(target=_open_browser_when_ready,
                          args=(url, host, port), daemon=True).start()
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    serve(app, host, port)
 
 
 if __name__ == "__main__":

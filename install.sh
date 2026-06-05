@@ -52,14 +52,18 @@ fi
 
 cd "$DIR"
 
-# --- virtual environment + core deps --------------------------------------
+# --- virtual environment ---------------------------------------------------
+# RJH's core runs on the Python standard library alone — no packages required,
+# so this works fully offline. The venv just gives an isolated home and a place
+# to add the optional extras later.
 if [ ! -d venv ]; then
     say "Creating virtual environment"
     "$PY" -m venv venv || die "Could not create a virtualenv. On Debian/Ubuntu: sudo apt install python3-venv"
 fi
-say "Installing core dependencies (fastapi, uvicorn, requests)"
-./venv/bin/python -m pip install --upgrade pip >/dev/null
-./venv/bin/python -m pip install -r requirements.txt
+# Best-effort: install anything uncommented in requirements.txt (nothing by
+# default). Skipped silently offline — the core needs none of it.
+./venv/bin/python -m pip install -r requirements.txt >/dev/null 2>&1 || \
+    warn "Skipped pip step (offline or no extras) — core runs on the standard library."
 
 # --- done ------------------------------------------------------------------
 say "RJH is installed in $DIR"
