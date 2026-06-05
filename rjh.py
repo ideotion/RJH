@@ -49,6 +49,7 @@ RUN
 
 import os
 import re
+import sys
 import csv
 import json
 import time
@@ -1535,8 +1536,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .group-title{font-size:13px;color:var(--acc2);font-weight:700;margin:4px 0 8px}
   .toast{position:fixed;bottom:18px;right:18px;background:var(--card);
     border:1px solid var(--line);padding:11px 15px;border-radius:9px;z-index:20}
-  #overlay{position:fixed;inset:0;background:#0008;display:flex;align-items:center;
+  #overlay{position:fixed;inset:0;background:#0008;display:none;align-items:center;
     justify-content:center;z-index:30;backdrop-filter:blur(2px)}
+  #overlay.show{display:flex}
   .spinner{width:42px;height:42px;border:4px solid var(--line);border-top-color:var(--acc);
     border-radius:50%;animation:spin 1s linear infinite}
   @keyframes spin{to{transform:rotate(360deg)}}
@@ -1768,7 +1770,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
 </main>
 <div id="toast" class="toast hide"></div>
-<div id="overlay" class="hide"><div class="ov-box"><div class="spinner"></div>
+<div id="overlay"><div class="ov-box"><div class="spinner"></div>
   <div id="overlayMsg">Working…</div><div class="sub" id="overlaySub"></div></div></div>
 <script>
 let currentJob = null;
@@ -1778,8 +1780,8 @@ function toast(m,kind){const t=document.getElementById('toast');t.textContent=m;
   setTimeout(()=>t.classList.add('hide'),3000);}
 function showOverlay(m,sub){document.getElementById('overlayMsg').textContent=m||'Working…';
   document.getElementById('overlaySub').textContent=sub||'';
-  document.getElementById('overlay').classList.remove('hide');}
-function hideOverlay(){document.getElementById('overlay').classList.add('hide');}
+  document.getElementById('overlay').classList.add('show');}
+function hideOverlay(){document.getElementById('overlay').classList.remove('show');}
 function copyBox(id){const el=document.getElementById(id);el.select();
   document.execCommand('copy');toast('Copied');}
 async function api(path,opts){const r=await fetch(path,opts);
@@ -2412,15 +2414,50 @@ def api_export(format: str = Query("csv")):
 # Entry point
 # --------------------------------------------------------------------------- #
 
+def _open_browser_when_ready(url, host, port):
+    """Wait for the server to accept connections, then open the default browser
+    once. Safe to fail (headless machines simply won't have a browser)."""
+    import socket
+    import webbrowser
+    target = "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
+    for _ in range(150):                      # up to ~15s
+        try:
+            with socket.create_connection((target, port), timeout=0.3):
+                break
+        except OSError:
+            time.sleep(0.1)
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+
 def main():
     init_db()
     cfg = load_config()
     audit("startup", "RJH started")
-    url = "http://{}:{}".format(cfg["host"], cfg["port"])
+    host = cfg["host"]
+    port = cfg["port"]
+    browse_host = "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
+    url = "http://{}:{}".format(browse_host, port)
+
+    # Auto-open the browser unless explicitly disabled.
+    no_browser = ("--no-browser" in sys.argv or
+                  os.environ.get("RJH_NO_BROWSER", "").lower() in ("1", "true", "yes"))
+
     print("\n  RJH — Reverse Job Hunting is running.")
-    print("  Open this in your browser:  " + url)
-    print("  Data + audit trail in:      " + DATA_DIR + "\n")
-    uvicorn.run(app, host=cfg["host"], port=cfg["port"], log_level="warning")
+    if no_browser:
+        print("  Open this in your browser:  " + url)
+    else:
+        print("  Opening your browser at:    " + url)
+        print("  (disable with --no-browser or RJH_NO_BROWSER=1)")
+    print("  Data + audit trail in:      " + DATA_DIR)
+    print("  Press Ctrl+C to stop.\n")
+
+    if not no_browser:
+        threading.Thread(target=_open_browser_when_ready,
+                         args=(url, host, port), daemon=True).start()
+    uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
 if __name__ == "__main__":
