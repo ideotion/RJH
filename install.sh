@@ -65,13 +65,21 @@ say "Installing core dependencies (fastapi, uvicorn, requests)"
 say "RJH is installed in $DIR"
 cat <<EOF
 
-  Start it with:
-      cd "$DIR" && ./venv/bin/python rjh.py
-  then open the printed URL (default http://127.0.0.1:8765) in your browser.
-
   Optional extras (opt-in, all local / open source):
     * Browser pre-fill:   ./venv/bin/python -m pip install playwright && ./venv/bin/playwright install firefox
     * PDF / ODT resumes:  ./venv/bin/python -m pip install pypdf odfpy
     * Local AI drafting:  install + manage Ollama from the app's Settings -> Setup tab
 
+  To start RJH again later:
+      cd "$DIR" && ./venv/bin/python rjh.py
+
 EOF
+
+# --- launch (auto-opens your browser). Skip with RJH_NO_START=1 -------------
+case "${RJH_NO_START:-}" in
+    1|true|yes|TRUE|YES)
+        say "Skipping launch (RJH_NO_START set). Start it with the command above." ;;
+    *)
+        say "Starting RJH — your browser will open automatically (Ctrl+C to stop)."
+        exec ./venv/bin/python rjh.py ;;
+esac

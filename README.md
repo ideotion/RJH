@@ -42,13 +42,13 @@ Auto-submitting to sites such as LinkedIn or Indeed violates their Terms of Serv
 
 ## Install
 
-One line (clones the repo, creates a virtualenv, installs the core dependencies):
+One line — clones the repo, creates a virtualenv, installs the core dependencies, then **starts RJH and opens it in your browser** automatically:
 
 ```
 curl -fsSL https://raw.githubusercontent.com/ideotion/RJH/main/install.sh | sh
 ```
 
-The installer is a short, readable, GPLv3 shell script ([install.sh](install.sh)) — it installs only the three core packages and starts nothing on its own. Set `RJH_DIR=/path` to choose where it goes (default `~/rjh`).
+The installer is a short, readable, GPLv3 shell script ([install.sh](install.sh)). Set `RJH_DIR=/path` to choose where it goes (default `~/rjh`), or `RJH_NO_START=1` to install without launching. To run it again later: `cd ~/rjh && ./venv/bin/python rjh.py`.
 
 Or do it by hand:
 
@@ -80,7 +80,7 @@ On non-Linux systems, install Ollama manually from https://ollama.com/download; 
 python3 rjh.py
 ```
 
-Open the printed URL (default http://127.0.0.1:8765). Your database and audit trail live in ./rjh_data/.
+RJH starts and **opens your default browser** at http://127.0.0.1:8765 automatically. Pass `--no-browser` (or set `RJH_NO_BROWSER=1`) to skip that. Your database and audit trail live in ./rjh_data/.
 
 ## Configure
 
