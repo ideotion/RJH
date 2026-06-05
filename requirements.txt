@@ -1,9 +1,15 @@
+# Core dependencies — required to run RJH.
 fastapi
 uvicorn
 requests
-# Optional: only needed for the browser pre-fill step.
-# After installing, run:  playwright install chromium
-playwright
-# Optional: only needed to import PDF / ODT resumes (parsed locally).
-pypdf
-odfpy
+
+# Optional extras. Uncomment a line (or `pip install` it) only if you want that
+# feature; RJH runs fully without them.
+#
+# Browser pre-fill assistant. After installing, fetch a browser engine with:
+#   playwright install firefox      (or: chromium / webkit)
+# playwright
+#
+# Import resumes from PDF / ODT files (parsed locally):
+# pypdf
+# odfpy

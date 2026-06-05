@@ -42,16 +42,24 @@ Auto-submitting to sites such as LinkedIn or Indeed violates their Terms of Serv
 
 ## Install
 
+One line (clones the repo, creates a virtualenv, installs the core dependencies):
+
+```
+curl -fsSL https://raw.githubusercontent.com/ideotion/RJH/main/install.sh | sh
+```
+
+The installer is a short, readable, GPLv3 shell script ([install.sh](install.sh)) — it installs only the three core packages and starts nothing on its own. Set `RJH_DIR=/path` to choose where it goes (default `~/rjh`).
+
+Or do it by hand:
+
 ```
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-# for the pre-fill step:
-playwright install chromium
 ```
 
 `requirements.txt` pins three required packages (fastapi, uvicorn, requests). The rest are optional and only loaded when the matching feature is used:
 
-- `playwright` — the browser pre-fill step.
+- `playwright` — the browser pre-fill step. After `pip install playwright`, fetch an engine with `playwright install firefox` (Firefox is the default; `chromium` and `webkit` also work, selectable in Settings).
 - `pypdf` / `odfpy` — importing a resume from a PDF or ODT file (parsed locally).
 
 The app starts and runs fully without any of the optional packages; each feature shows a clear hint if its dependency is missing.
