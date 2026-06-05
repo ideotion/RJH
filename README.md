@@ -18,7 +18,7 @@ The principles RJH is built on live in [MANIFESTO.md](MANIFESTO.md).
 
 ## What it does
 
-1. Collects job postings from config-driven source adapters (any RSS or Atom feed), respecting robots.txt and per-domain rate limits.
+1. Collects job postings from config-driven source adapters (RSS/Atom feeds and JSON job APIs), respecting robots.txt and per-domain rate limits — or import a CSV/JSON list of jobs directly when you have no feed configured.
 2. Stores them in a searchable local SQLite database with duplicate detection (URL canonicalization plus content hashing).
 3. Enriches each posting locally: scores it against your master profile, parses a salary range from the text, and extracts competency tags — no AI required.
 4. Lets you full-text search across title, company, location, country, salary, competencies and description, and sort by any column (score, title, company, location, salary, competencies, status) just by clicking the header.
@@ -78,7 +78,9 @@ Open the printed URL (default http://127.0.0.1:8765). Your database and audit tr
 
 Everything is editable from the Settings tab and persisted to rjh_data/config.json.
 
-Sources: add any RSS/Atom feed; set enabled true and a real URL.
+Sources: three adapter types, all config-driven. `demo` is the bundled offline sample. `rss` reads any RSS/Atom feed. `json_api` reads any JSON jobs API — point `url` at the endpoint, set `root` to the key holding the list, and optionally `map` your fields onto ours (`title`, `company`, `location`, `url`, `description`, `posted_at`, `salary`). A ready-to-run example, **Arbeitnow** (a free, no-auth European job-board API), ships disabled; flip `enabled` to `true` to use it. **EURES** (https://eures.europa.eu), the official EU portal, remains the recommended primary source — paste an official EURES/national-PES feed URL and enable it. Network sources ship disabled so nothing is fetched until you opt in.
+
+Import jobs: don't want to configure a feed yet? Click **Import jobs…** on the Jobs tab to load listings from a **CSV or JSON** file. Column/key names are matched flexibly (e.g. `Job Title`, `job_title`, `position` all map to the title), each row is de-duplicated and enriched (salary + competencies) just like collected jobs.
 
 AI document tools: off-by-default-friendly. The **Enable AI document tools** checkbox in Settings turns the optional Ollama layer on or off. With it off, the Documents tab and the per-job Generate buttons disappear and the rest of the app is unaffected. After enabling, use **Settings → Setup** to install Ollama and pull a model.
 
@@ -90,7 +92,7 @@ Profile: fill in your master profile, keywords (which drive scoring), and option
 
 ## Roadmap
 
-- More worked source adapters (EURES, national PES feeds, generic JSON API).
+- More worked source adapters (an official EURES/national-PES feed once a stable public URL is settled on).
 - A selector-capture helper to build site rules faster.
 - Optional semantic matching and richer scoring.
 - Local-LLM translation and summarization of postings.

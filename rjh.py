@@ -120,15 +120,37 @@ DEFAULT_CONFIG = {
     # Country preference for Western & Northern Europe. ISO-2 codes, ordered.
     "preferred_countries": ["NL", "DE", "SE", "DK", "NO", "FI", "BE",
                             "LU", "AT", "CH", "IE", "IS", "GB", "FR"],
-    # Config-driven sources. type "rss" works for any RSS/Atom feed.
-    # The demo source lets the app run end-to-end offline so you can try the
-    # workflow immediately. EURES (the official EU portal) ships disabled with a
-    # placeholder URL; paste a real official feed URL and flip enabled to true.
+    # Config-driven sources.
+    #   type "demo"     -> bundled offline sample, so the app works on first run.
+    #   type "rss"      -> any RSS/Atom feed.
+    #   type "json_api" -> any JSON jobs API; "map" overrides field detection,
+    #                      "root" points at the list, "default_country" fills gaps.
+    # Network sources ship DISABLED so nothing is fetched until you opt in. Flip
+    # "enabled" to true to use one. Arbeitnow is a real, free, no-auth European
+    # job API included as a ready-to-run example. EURES (the official EU portal)
+    # is the recommended primary source: paste an official EURES/national-PES feed
+    # URL and enable it.
     "sources": [
         {
             "name": "DEMO (offline sample)",
             "type": "demo",
             "enabled": True,
+            "default_country": "EU"
+        },
+        {
+            "name": "Arbeitnow (EU job board API)",
+            "type": "json_api",
+            "enabled": False,
+            "url": "https://www.arbeitnow.com/api/job-board-api",
+            "root": "data",
+            "map": {
+                "title": "title",
+                "company": "company_name",
+                "location": "location",
+                "url": "url",
+                "description": "description",
+                "posted_at": "created_at"
+            },
             "default_country": "EU"
         },
         {
@@ -456,6 +478,108 @@ DEMO_JOBS = [
 ]
 
 
+# Default source-key candidates for the generic JSON-API adapter. A source can
+# override any field via its "map" (our field -> source key, or list of keys).
+_JSON_FIELD_CANDIDATES = {
+    "title": ["title", "job_title", "position", "name", "vacancy_title"],
+    "company": ["company_name", "company", "employer", "organization",
+                "organisation", "hiringOrganization"],
+    "location": ["location", "city", "place", "workLocation", "region"],
+    "country": ["country", "country_code", "countryCode"],
+    "url": ["url", "link", "apply_url", "application_url", "redirect_url",
+            "applyUrl", "jobUrl"],
+    "description": ["description", "summary", "details", "content", "body",
+                    "job_description"],
+    "posted_at": ["created_at", "posted_at", "date", "published", "pubDate",
+                  "datePosted", "publication_date"],
+    "salary": ["salary", "salary_range", "compensation", "pay", "baseSalary"],
+}
+
+
+def _dig(obj, path):
+    cur = obj
+    for part in path.split("."):
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        else:
+            return None
+    return cur
+
+
+def _json_first(item, names):
+    for n in names:
+        if n in item and item[n] not in (None, ""):
+            return item[n]
+    return ""
+
+
+def _normalize_date(v):
+    """Best-effort: accept ISO strings as-is, convert epoch seconds/millis."""
+    if v in (None, ""):
+        return ""
+    if isinstance(v, (int, float)) or (isinstance(v, str) and v.isdigit()):
+        try:
+            ts = float(v)
+            if ts > 1e12:          # milliseconds
+                ts /= 1000
+            return dt.datetime.fromtimestamp(ts).isoformat(timespec="seconds")
+        except Exception:
+            return str(v)
+    return str(v)
+
+
+def parse_json_api(text, src):
+    """Generic JSON job-API adapter. Finds the list of postings (via src['root']
+    dotted path, a top-level list, or common keys) and maps each item to our
+    normalized job dict. Pure parsing — no network — so it is unit-testable."""
+    data = json.loads(text)
+    root = src.get("root")
+    items = None
+    if root:
+        items = _dig(data, root)
+    elif isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        for k in ("data", "jobs", "results", "items", "hits", "postings"):
+            if isinstance(data.get(k), list):
+                items = data[k]
+                break
+    if not isinstance(items, list):
+        return []
+    fieldmap = src.get("map", {})
+    strip_html = src.get("strip_html", True)
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+
+        def val(field):
+            spec = fieldmap.get(field)
+            names = (spec if isinstance(spec, list) else [spec]) if spec \
+                else _JSON_FIELD_CANDIDATES.get(field, [])
+            return _json_first(it, names)
+
+        url = val("url")
+        if not url:
+            continue
+        desc = str(val("description") or "")
+        if strip_html:
+            desc = html.unescape(re.sub(r"<[^>]+>", " ", desc))
+            desc = re.sub(r"\s+", " ", desc).strip()
+        out.append({
+            "source": src["name"],
+            "title": html.unescape(str(val("title") or "")),
+            "company": html.unescape(str(val("company") or "")),
+            "location": str(val("location") or ""),
+            "country": str(val("country") or src.get("default_country", "")),
+            "url": str(url),
+            "description": desc,
+            "salary": str(val("salary") or ""),
+            "posted_at": _normalize_date(val("posted_at")),
+        })
+    return out
+
+
 def collect_from_source(src, cfg):
     """Returns a list of normalized job dicts for one source."""
     out = []
@@ -501,7 +625,52 @@ def collect_from_source(src, cfg):
             audit("fetch_error", "{}: {}".format(url, e))
         return out
 
+    if stype == "json_api":
+        url = src.get("url", "")
+        if not url or url.startswith("PASTE_"):
+            return out
+        if not robots_allows(url, cfg):
+            audit("robots_blocked", url)
+            return out
+        try:
+            resp = rate_limited_get(url, cfg)
+            if resp.status_code != 200:
+                audit("fetch_failed", "{} -> {}".format(url, resp.status_code))
+                return out
+            out = parse_json_api(resp.text, src)
+        except Exception as e:
+            audit("fetch_error", "{}: {}".format(url, e))
+        return out
+
     return out
+
+
+def store_job(conn, j, cfg, profile):
+    """Dedup, enrich and insert one normalized job dict on an open connection.
+    Returns True if inserted, False if it was a duplicate. Shared by the
+    collector and by CSV/JSON import so every path enriches identically."""
+    if not j.get("url"):
+        return False
+    uh = url_hash(j["url"])
+    ch = content_hash(j.get("title"), j.get("company"), j.get("description"))
+    exists = conn.execute(
+        "SELECT 1 FROM jobs WHERE url_hash = ? OR content_hash = ?",
+        (uh, ch)).fetchone()
+    if exists:
+        return False
+    score = score_job(j, profile, cfg)
+    salary, smin, smax, comps = enrich_job(j, profile)
+    conn.execute(
+        """INSERT INTO jobs (source,url,canonical_url,url_hash,content_hash,
+           title,company,location,country,description,salary,salary_min,
+           salary_max,keywords,posted_at,fetched_at,score,status)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'new')""",
+        (j.get("source"), j.get("url"), canonicalize_url(j["url"]), uh, ch,
+         j.get("title"), j.get("company"), j.get("location"),
+         j.get("country"), j.get("description"), salary, smin, smax, comps,
+         j.get("posted_at"),
+         dt.datetime.now().isoformat(timespec="seconds"), score))
+    return True
 
 
 def collect_all(cfg):
@@ -509,28 +678,11 @@ def collect_all(cfg):
     profile = get_profile()
     for src in cfg.get("sources", []):
         for j in collect_from_source(src, cfg):
-            uh = url_hash(j["url"])
-            ch = content_hash(j.get("title"), j.get("company"), j.get("description"))
             with _db_lock, db() as conn:
-                exists = conn.execute(
-                    "SELECT 1 FROM jobs WHERE url_hash = ? OR content_hash = ?",
-                    (uh, ch)).fetchone()
-                if exists:
+                if store_job(conn, j, cfg, profile):
+                    added += 1
+                else:
                     skipped += 1
-                    continue
-                score = score_job(j, profile, cfg)
-                salary, smin, smax, comps = enrich_job(j, profile)
-                conn.execute(
-                    """INSERT INTO jobs (source,url,canonical_url,url_hash,content_hash,
-                       title,company,location,country,description,salary,salary_min,
-                       salary_max,keywords,posted_at,fetched_at,score,status)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'new')""",
-                    (j.get("source"), j.get("url"), canonicalize_url(j["url"]), uh, ch,
-                     j.get("title"), j.get("company"), j.get("location"),
-                     j.get("country"), j.get("description"), salary, smin, smax, comps,
-                     j.get("posted_at"),
-                     dt.datetime.now().isoformat(timespec="seconds"), score))
-                added += 1
     audit("collect", "added={} skipped(dupes)={}".format(added, skipped))
     return {"added": added, "skipped": skipped}
 
@@ -672,8 +824,16 @@ def extract_competencies(job, profile, max_items=12):
 
 
 def enrich_job(job, profile):
-    """Attach salary + competencies to a job dict prior to insert/rescore."""
-    raw, lo, hi = extract_salary(job.get("description", ""))
+    """Attach salary + competencies to a job dict prior to insert/rescore. An
+    explicit `salary` field (e.g. a CSV column) is parsed first; otherwise the
+    figure is mined from the description."""
+    raw, lo, hi = "", None, None
+    if job.get("salary"):
+        raw, lo, hi = extract_salary(str(job["salary"]))
+        if not raw:                       # keep the provided text even if unparsable
+            raw = str(job["salary"]).strip()
+    if not raw:
+        raw, lo, hi = extract_salary(job.get("description", ""))
     comps = extract_competencies(job, profile)
     return raw, lo, hi, ", ".join(comps)
 
@@ -874,6 +1034,99 @@ def extract_resume_text(filename, data):
         return _extract_odt(data)
     return None, ("Unsupported file type '.{}'. Use PDF, ODT, TXT, or MD.".format(ext)
                   if ext else "File has no extension; use PDF, ODT, TXT, or MD.")
+
+
+# --------------------------------------------------------------------------- #
+# Job-list import (CSV / JSON) — feed RJH without configuring a live source
+# --------------------------------------------------------------------------- #
+
+# Header aliases so a wide range of CSV/JSON exports map onto our fields.
+_JOB_FIELD_ALIASES = {
+    "title": ("title", "job_title", "position", "role", "name", "vacancy"),
+    "company": ("company", "company_name", "employer", "organization",
+                "organisation"),
+    "location": ("location", "city", "place", "where", "region"),
+    "country": ("country", "country_code"),
+    "url": ("url", "link", "apply_url", "application_url", "href", "job_url"),
+    "description": ("description", "summary", "details", "text", "body",
+                    "job_description"),
+    "posted_at": ("posted_at", "date", "published", "posted", "created_at"),
+    "salary": ("salary", "salary_range", "compensation", "pay", "wage"),
+}
+
+
+def _map_job_row(row):
+    """Map an arbitrary dict (CSV row or JSON object) onto a normalized job.
+    Header keys are normalized so "Job Title", "job-title" and "job_title" all
+    match the same alias."""
+    lower = {}
+    for k, v in row.items():
+        if k is None:
+            continue
+        key = re.sub(r"[\s\-]+", "_", str(k).strip().lower())
+        lower[key] = v
+    job = {}
+    for field, aliases in _JOB_FIELD_ALIASES.items():
+        for a in aliases:
+            if a in lower and lower[a] not in (None, ""):
+                job[field] = str(lower[a]).strip()
+                break
+    return job
+
+
+def parse_jobs_file(filename, data):
+    """Return (jobs, error). Accepts JSON (a list, or an object with a
+    data/jobs/results/items list) and CSV with a header row."""
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in (filename or "") else ""
+    text = data.decode("utf-8-sig", "replace")
+    if ext == "json" or (not ext and text.lstrip()[:1] in "[{"):
+        try:
+            obj = json.loads(text)
+        except Exception as e:
+            return None, "Invalid JSON: {}".format(e)
+        if isinstance(obj, dict):
+            rows = None
+            for k in ("data", "jobs", "results", "items"):
+                if isinstance(obj.get(k), list):
+                    rows = obj[k]
+                    break
+            if rows is None:
+                return None, ("JSON object has no jobs list "
+                              "(expected a top-level array or a data/jobs key).")
+        elif isinstance(obj, list):
+            rows = obj
+        else:
+            return None, "JSON must be an array of jobs or an object with a jobs list."
+        jobs = [_map_job_row(r) for r in rows if isinstance(r, dict)]
+        return jobs, None
+    if ext in ("csv", "tsv", "") :
+        delim = "\t" if ext == "tsv" else ","
+        try:
+            reader = csv.DictReader(StringIO(text), delimiter=delim)
+            jobs = [_map_job_row(r) for r in reader]
+        except Exception as e:
+            return None, "Could not parse CSV: {}".format(e)
+        return jobs, None
+    return None, "Unsupported file type '.{}'. Use CSV or JSON.".format(ext)
+
+
+def import_jobs(jobs, cfg, source_label):
+    """Dedup + enrich + insert imported jobs. Returns counts."""
+    profile = get_profile()
+    added = skipped = 0
+    for j in jobs:
+        if not j.get("url"):
+            skipped += 1
+            continue
+        j.setdefault("source", source_label)
+        with _db_lock, db() as conn:
+            if store_job(conn, j, cfg, profile):
+                added += 1
+            else:
+                skipped += 1
+    audit("import_jobs", "added={} skipped={} total={}".format(
+        added, skipped, len(jobs)))
+    return {"ok": True, "added": added, "skipped": skipped, "total": len(jobs)}
 
 
 # --------------------------------------------------------------------------- #
@@ -1277,6 +1530,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <input id="minScore" type="number" min="0" max="100" value="0" style="width:90px" title="Min score"/>
       <button class="btn sec" id="searchBtn">Filter</button>
       <button class="btn sec" id="rescoreBtn" title="Recompute score, salary and competencies for all stored jobs">Re-score all</button>
+      <input type="file" id="importJobsFile" accept=".csv,.json,.tsv" class="hide"/>
+      <button class="btn sec" id="importJobsBtn" title="Import job listings from a CSV or JSON file">Import jobs…</button>
       <a class="btn sec" href="/api/export?format=csv">Export CSV</a>
       <a class="btn sec" href="/api/export?format=json">Export JSON</a>
     </div>
@@ -1696,6 +1951,20 @@ document.getElementById('rescoreBtn').onclick=async()=>{
   catch(e){toast('Re-score failed','err');}
   finally{hideOverlay();}
 };
+document.getElementById('importJobsBtn').onclick=()=>document.getElementById('importJobsFile').click();
+document.getElementById('importJobsFile').onchange=async(ev)=>{
+  const f=ev.target.files[0];if(!f)return;
+  showOverlay('Importing jobs from '+f.name+'…','Parsing locally.');
+  try{
+    const buf=await f.arrayBuffer();
+    const r=await fetch('/api/import_jobs?filename='+encodeURIComponent(f.name)
+      +'&source='+encodeURIComponent('Import: '+f.name),{method:'POST',body:buf});
+    const j=await r.json();
+    if(!r.ok||!j.ok){toast(j.error||'Import failed','err');return;}
+    toast('Imported '+j.added+', skipped '+j.skipped+' of '+j.total,'ok');loadJobs();
+  }catch(e){toast('Import failed: '+e.message,'err');}
+  finally{hideOverlay();ev.target.value='';}
+};
 
 async function loadProfile(){
   const p=await api('/api/profile');
@@ -1830,6 +2099,23 @@ async def api_import_resume(request: Request, filename: str = Query("resume.txt"
     return {"ok": True, "text": text, "chars": len(text or ""), "filename": filename}
 
 
+@app.post("/api/import_jobs")
+async def api_import_jobs(request: Request,
+                         filename: str = Query("jobs.csv"),
+                         source: str = Query("File import")):
+    data = await request.body()
+    if not data:
+        return JSONResponse({"ok": False, "error": "Empty file."}, status_code=400)
+    jobs, err = parse_jobs_file(filename, data)
+    if err:
+        return JSONResponse({"ok": False, "error": err}, status_code=400)
+    if not jobs:
+        return JSONResponse({"ok": False, "error": "No rows found in the file."},
+                            status_code=400)
+    result = import_jobs(jobs, load_config(), source)
+    return result
+
+
 @app.get("/api/profile")
 def api_get_profile():
     return get_profile()
@@ -1901,7 +2187,7 @@ def api_jobs(q: str = "", status: str = "", min_score: int = 0,
     if q:
         # free-text search across every human-meaningful field
         fields = ("title", "company", "location", "country", "description",
-                  "salary", "keywords", "source")
+                  "salary", "keywords", "source", "url")
         sql += " AND (" + " OR ".join(f + " LIKE ?" for f in fields) + ")"
         params += ["%" + q + "%"] * len(fields)
     col = _SORT_COLUMNS.get(sort, "score")
