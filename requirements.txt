@@ -12,3 +12,8 @@
 # Import resumes from PDF / ODT files (parsed locally):
 # pypdf
 # odfpy
+#
+# Cleaner job-description text from CRAWLED posting pages. Without it the crawler
+# falls back to a built-in stdlib HTML-to-text reader, so this is purely a
+# quality upgrade — the feature works either way:
+# trafilatura

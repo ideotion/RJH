@@ -9,17 +9,28 @@ or later. See the LICENSE file for the full text. This program comes with
 ABSOLUTELY NO WARRANTY.
 
 WHAT IT DOES
-  1. Collects job postings from config-driven source adapters (RSS/Atom feeds),
-     respecting robots.txt and per-domain rate limits.
+  1. Collects job postings from config-driven source adapters (RSS/Atom feeds and
+     JSON job APIs), from job-alert EMAIL (IMAP/POP3/.eml), and by CRAWLING a
+     careers page or ATS. Every fetch goes through one ethical pathway: an SSRF
+     guard, robots.txt (fail-closed for auto-discovered URLs), per-domain rate
+     limiting incl. Crawl-delay, and conditional GET so unchanged sources are
+     skipped.
   2. Stores them in a searchable local SQLite database with duplicate detection
      (URL canonicalization + content hashing).
   3. Scores each posting against your master profile so the best fits surface first.
-  4. Uses your LOCAL Ollama instance to tailor a resume and cover letter per job.
-     Nothing about you ever leaves your machine.
-  5. Optionally pre-fills the application form in a real browser (Playwright) and
+  4. Uses your LOCAL Ollama instance to tailor a resume and cover letter per job,
+     and — optionally — to extract skills/entities, translate a posting, and write
+     an honest fit summary. Nothing about you ever leaves your machine.
+  5. Compiles the tailored documents into formatted OpenDocument (.odt) files with
+     a built-in stdlib compiler (no third-party packages) — download them, or let
+     pre-fill attach them.
+  6. Optionally pre-fills the application form in a real browser (Playwright) and
      then STOPS. You review, edit, and click submit yourself. That click is the
      only thing that ever sends anything.
-  6. Logs every action to the database and to a dated markdown audit trail.
+  7. Can run the whole collect -> enrich -> (optional) draft pipeline on a
+     background schedule, unattended, staging everything for your review. It
+     never submits.
+  8. Logs every action to the database and to a dated markdown audit trail.
 
 ETHICS (non-negotiable, baked in)
   - Respects robots.txt for every domain before fetching.
@@ -53,14 +64,25 @@ import json
 import time
 import html
 import shutil
+import socket
+import zipfile
+import poplib
+import imaplib
 import hashlib
 import sqlite3
 import platform
+import ipaddress
 import threading
 import subprocess
+import email as email_lib
 import datetime as dt
 from io import StringIO, BytesIO
-from urllib.parse import (urlparse, urlunparse, parse_qsl, parse_qs, urlencode)
+from email.header import decode_header
+from email.utils import getaddresses, parsedate_to_datetime
+from collections import deque
+from html.parser import HTMLParser
+from urllib.parse import (urlparse, urlunparse, parse_qsl, parse_qs, urlencode,
+                          urljoin, unquote)
 from urllib import robotparser
 import urllib.request
 import urllib.error
@@ -92,6 +114,15 @@ try:
     ODFPY_AVAILABLE = True
 except BaseException:
     ODFPY_AVAILABLE = False
+
+# Only used to extract a clean job description from a crawled posting page. When
+# absent, the crawler falls back to a stdlib HTML-to-text reader, so the feature
+# works either way — trafilatura just produces cleaner body text.
+try:
+    import trafilatura  # noqa: F401
+    TRAFILATURA_AVAILABLE = True
+except BaseException:
+    TRAFILATURA_AVAILABLE = False
 
 
 # --------------------------------------------------------------------------- #
@@ -253,6 +284,55 @@ DEFAULT_CONFIG = {
             "default_country": "EU"
         }
     ],
+    # Job-alert email ingestion. The job boards that forbid scraping (LinkedIn,
+    # Indeed, …) will happily EMAIL you matching roles — those alerts are pushed
+    # to you, so reading them breaks no Terms of Service. RJH connects read-only
+    # to your mailbox over IMAP/POP3, parses the postings out of each alert, and
+    # NEVER stores the recipient (your address is read only to redact it). All
+    # parsing is local. Disabled until you fill in credentials and flip "enabled".
+    # You can also import a saved .eml with no mailbox access at all (Jobs tab).
+    "email_ingest": {
+        "enabled": False,
+        "protocol": "imap",            # "imap" or "pop3"
+        "host": "",                    # e.g. imap.gmail.com
+        "port": 0,                     # 0 = default (993 IMAP-SSL / 995 POP-SSL)
+        "ssl": True,
+        "username": "",
+        "password": "",               # stored locally in config.json; use an app password
+        "folder": "INBOX",            # IMAP only
+        "search": "UNSEEN",           # IMAP search filter; "ALL" for everything
+        "mark_seen": False,            # IMAP: mark fetched mail as read
+        "max_messages": 50,
+        "default_country": "EU",
+        "sender_allowlist": []        # optional: only parse mail from these addresses
+    },
+    # Careers-page crawler. Point it at a company's careers page (or an ATS like
+    # Greenhouse/Lever) and it discovers the individual postings, staying on the
+    # same site, honouring robots.txt (fail-closed) and the per-domain rate limit,
+    # and stopping at the depth/page caps. All entries ship DISABLED. Prefer an
+    # official feed or an emailed alert where one exists; crawl only public pages.
+    "crawl_sources": [
+        {
+            "name": "Example careers page (disabled sample)",
+            "enabled": False,
+            "url": "https://careers.example.com/",
+            "max_depth": 1,
+            "max_pages": 40,
+            "same_host": True,
+            "default_country": "EU"
+        }
+    ],
+    # Background scheduler. Off by default. When on, RJH runs the whole collect ->
+    # enrich -> (optional) draft pipeline on an interval, unattended, and stages
+    # everything for your review. It NEVER submits — the final click is always
+    # yours, exactly as when you run a collection by hand.
+    "scheduler": {
+        "enabled": False,
+        "interval_minutes": 60,
+        "auto_generate": False,        # auto-draft docs for top new matches (needs Ollama)
+        "auto_generate_min_score": 75,
+        "auto_generate_max_per_run": 3
+    },
     # Per-site pre-fill rules. The first rule whose lowercased "match" is a
     # substring of the job URL (or its host) wins. "fields" maps a category to an
     # ordered list of CSS selectors to try; "uploads" maps a file kind to
@@ -363,6 +443,36 @@ def init_db():
                 action TEXT,
                 detail TEXT
             );
+            -- Conditional-GET validators per URL, so unchanged feeds/pages are
+            -- skipped with a 304 instead of being re-downloaded and re-parsed.
+            CREATE TABLE IF NOT EXISTS fetch_meta (
+                url_hash TEXT PRIMARY KEY,
+                url TEXT,
+                etag TEXT,
+                last_modified TEXT,
+                fetched_at TEXT
+            );
+            -- Optional local-LLM analysis per job (keyword/entity extraction,
+            -- a translation, and an honest fit summary). Kept apart from the
+            -- rule-based fields so AI-derived text is always clearly labelled.
+            CREATE TABLE IF NOT EXISTS analysis (
+                job_id INTEGER PRIMARY KEY,
+                terms TEXT,
+                translation TEXT,
+                summary TEXT,
+                model TEXT,
+                created_at TEXT
+            );
+            -- History of background-scheduler passes (for the Automation panel).
+            CREATE TABLE IF NOT EXISTS scheduler_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TEXT,
+                finished_at TEXT,
+                added INTEGER,
+                skipped INTEGER,
+                generated INTEGER,
+                error TEXT
+            );
             CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
             CREATE INDEX IF NOT EXISTS idx_jobs_score ON jobs(score);
             CREATE INDEX IF NOT EXISTS idx_docs_job ON documents(job_id);
@@ -430,12 +540,21 @@ def get_documents(job_id):
 # Ethical fetching: robots.txt + per-domain rate limiting + dedup helpers
 # --------------------------------------------------------------------------- #
 
-_robots_cache = {}
+_robots_cache = {}          # base -> (RobotFileParser|None, fetched_at)
 _last_hit = {}
 _rl_lock = threading.Lock()
+_ROBOTS_TTL = 3600          # re-read a domain's robots.txt at most hourly
 
 TRACKING_PARAMS = {"utm_source", "utm_medium", "utm_campaign", "utm_term",
-                   "utm_content", "gclid", "fbclid", "ref", "source"}
+                   "utm_content", "gclid", "fbclid", "ref", "source", "mc_cid",
+                   "mc_eid", "igshid", "trk", "trackingId", "lipi", "midToken",
+                   "refId", "ref_", "spm", "_hsenc", "_hsmi"}
+
+# Query keys whose value is the *real* destination URL, used by the redirect
+# wrappers that job-alert emails and search pages love. We unwrap these so the
+# stored URL points at the actual posting, not a tracker.
+REDIRECT_PARAMS = ("url", "u", "dest", "destination", "redirect", "redirect_url",
+                   "target", "targeturl", "link", "to", "out", "q", "r")
 
 
 def canonicalize_url(url):
@@ -465,38 +584,206 @@ def content_hash(title, company, description):
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()
 
 
-def robots_allows(url, cfg):
+def sanitize_link(url, base=None):
+    """Turn a tracking/redirect link into the real destination. Unwraps a
+    wrapped URL carried in a redirect query parameter, resolves relative links
+    against `base`, and strips tracking parameters and fragments. Used for both
+    email-alert links and crawled hrefs so what we store points at the posting."""
+    if not url:
+        return ""
+    url = url.strip()
+    if base:
+        url = urljoin(base, url)
+    try:
+        for _ in range(3):                         # unwrap nested redirectors
+            p = urlparse(url)
+            if p.scheme not in ("http", "https"):
+                break
+            q = dict(parse_qsl(p.query, keep_blank_values=False))
+            wrapped = ""
+            for key in REDIRECT_PARAMS:
+                v = q.get(key, "")
+                cand = unquote(v) if v else ""
+                if cand.startswith("http://") or cand.startswith("https://"):
+                    wrapped = cand
+                    break
+            if wrapped and wrapped != url:
+                url = wrapped
+                continue
+            break
+    except Exception:
+        return url
+    return canonicalize_url(url)
+
+
+def url_is_fetchable(url):
+    """SSRF guard. Only http(s) URLs that resolve exclusively to public IP
+    addresses pass — protecting localhost, the cloud metadata endpoint, and any
+    private/link-local range from being reached via a crawled or emailed link."""
+    try:
+        p = urlparse(url)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            return False
+        infos = socket.getaddrinfo(p.hostname, p.port or (443 if p.scheme == "https" else 80),
+                                   proto=socket.IPPROTO_TCP)
+    except Exception:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                or ip.is_multicast or ip.is_unspecified):
+            return False
+    return True
+
+
+def _load_robots(base, cfg):
+    """Fetch and parse robots.txt for an origin with our honest UA and a timeout.
+    Returns a parsed RobotFileParser, or None when robots.txt cannot be POSITIVELY
+    determined (network error, timeout, or 5xx) so strict callers can fail closed.
+    A 404 means 'no restrictions'; a 401/403 on robots.txt means 'disallow all'."""
+    rp = robotparser.RobotFileParser()
+    rp.set_url(base + "/robots.txt")
+    try:
+        resp = requests.get(base + "/robots.txt",
+                            headers={"User-Agent": USER_AGENT},
+                            timeout=cfg.get("request_timeout", 20))
+    except Exception:
+        return None
+    code = resp.status_code
+    if code in (401, 403):
+        rp.disallow_all = True
+        return rp
+    if 400 <= code < 500:
+        rp.allow_all = True
+        return rp
+    if code >= 500:
+        return None
+    try:
+        rp.parse(resp.text.splitlines())
+    except Exception:
+        return None
+    return rp
+
+
+def _robots_for(base, cfg):
+    with _rl_lock:
+        cached = _robots_cache.get(base)
+        if cached and (time.time() - cached[1]) < _ROBOTS_TTL:
+            return cached[0]
+    rp = _load_robots(base, cfg)
+    with _rl_lock:
+        _robots_cache[base] = (rp, time.time())
+    return rp
+
+
+def robots_allows(url, cfg, strict=False):
+    """Is `url` allowed by robots.txt? `strict` controls what happens when we
+    cannot positively determine the answer: user-configured feeds (strict=False)
+    are allowed (the user opted in), while auto-discovered/crawled URLs
+    (strict=True) are refused — fail-open vs fail-closed."""
     p = urlparse(url)
     if not p.netloc:
         return False
     base = "{}://{}".format(p.scheme or "https", p.netloc)
-    rp = _robots_cache.get(base, "MISSING")
-    if rp == "MISSING":
-        rp = robotparser.RobotFileParser()
-        rp.set_url(base + "/robots.txt")
-        try:
-            rp.read()
-        except Exception:
-            # If robots.txt cannot be read, treat the configured feed as opt-in
-            # and allow it (the user explicitly pointed us at this feed).
-            rp = None
-        _robots_cache[base] = rp
+    rp = _robots_for(base, cfg)
     if rp is None:
-        return True
+        return not strict
     return rp.can_fetch(USER_AGENT, url)
 
 
-def rate_limited_get(url, cfg):
+def robots_crawl_delay(url, cfg):
+    """The Crawl-delay robots.txt asks of us for this origin, in seconds, or 0."""
+    p = urlparse(url)
+    base = "{}://{}".format(p.scheme or "https", p.netloc)
+    rp = _robots_for(base, cfg)
+    if rp is None:
+        return 0.0
+    try:
+        d = rp.crawl_delay(USER_AGENT)
+        return float(d) if d else 0.0
+    except Exception:
+        return 0.0
+
+
+def _rate_limit_wait(url, cfg):
+    """Sleep just long enough to honour the larger of the configured per-domain
+    interval and any robots.txt Crawl-delay for this origin."""
     domain = urlparse(url).netloc
-    interval = float(cfg.get("rate_limit_seconds", 5))
+    interval = max(float(cfg.get("rate_limit_seconds", 5)),
+                   robots_crawl_delay(url, cfg))
     with _rl_lock:
         last = _last_hit.get(domain, 0)
         wait = interval - (time.time() - last)
         if wait > 0:
             time.sleep(wait)
         _last_hit[domain] = time.time()
-    return requests.get(url, headers={"User-Agent": USER_AGENT},
-                        timeout=cfg.get("request_timeout", 20))
+
+
+def _get_fetch_meta(url):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT etag, last_modified FROM fetch_meta WHERE url_hash = ?",
+            (url_hash(url),)).fetchone()
+    return (row["etag"], row["last_modified"]) if row else (None, None)
+
+
+def _set_fetch_meta(url, etag, last_modified):
+    if not (etag or last_modified):
+        return
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    with _db_lock, db() as conn:
+        conn.execute(
+            "INSERT INTO fetch_meta (url_hash,url,etag,last_modified,fetched_at) "
+            "VALUES (?,?,?,?,?) ON CONFLICT(url_hash) DO UPDATE SET "
+            "etag=excluded.etag, last_modified=excluded.last_modified, "
+            "fetched_at=excluded.fetched_at",
+            (url_hash(url), url, etag, last_modified, now))
+
+
+def ethical_get(url, cfg, *, strict=True, conditional=False, extra_headers=None):
+    """The single, mandatory fetch pathway. Enforces, in order: an SSRF guard
+    (strict only), robots.txt (fail-closed when strict), and the per-domain rate
+    limit incl. Crawl-delay. Optionally sends conditional-GET validators and
+    stores the new ones. Returns an _HTTPResponse (with a `.not_modified` flag),
+    or None when the fetch was refused — the reason is written to the audit log."""
+    if strict and not url_is_fetchable(url):
+        audit("fetch_blocked", "non-public or non-http target: {}".format(url))
+        return None
+    if not robots_allows(url, cfg, strict=strict):
+        audit("robots_blocked", url)
+        return None
+    headers = {"User-Agent": USER_AGENT}
+    if extra_headers:
+        headers.update(extra_headers)
+    if conditional:
+        etag, last_mod = _get_fetch_meta(url)
+        if etag:
+            headers["If-None-Match"] = etag
+        if last_mod:
+            headers["If-Modified-Since"] = last_mod
+    _rate_limit_wait(url, cfg)
+    resp = requests.get(url, headers=headers, timeout=cfg.get("request_timeout", 20))
+    resp.not_modified = (resp.status_code == 304)
+    if conditional and resp.status_code == 200:
+        _set_fetch_meta(url, resp.headers.get("ETag"),
+                        resp.headers.get("Last-Modified"))
+    return resp
+
+
+def rate_limited_get(url, cfg):
+    """Compatibility shim: a non-strict ethical fetch (robots fail-open, rate
+    limited), kept so any site rule or test calling it still works. Raises on a
+    refused fetch so a caller's try/except logs it as a fetch error. New code
+    should call ethical_get directly."""
+    resp = ethical_get(url, cfg, strict=False)
+    if resp is None:
+        raise _ConnectionError("fetch refused by robots.txt or guard")
+    return resp
 
 
 # --------------------------------------------------------------------------- #
@@ -694,11 +981,12 @@ def collect_from_source(src, cfg):
         url = src.get("url", "")
         if not url or url.startswith("PASTE_"):
             return out
-        if not robots_allows(url, cfg):
-            audit("robots_blocked", url)
-            return out
         try:
-            resp = rate_limited_get(url, cfg)
+            resp = ethical_get(url, cfg, strict=False, conditional=True)
+            if resp is None:
+                return out                  # refused — reason already audited
+            if resp.not_modified:
+                return out                  # unchanged since the last fetch
             if resp.status_code != 200:
                 audit("fetch_failed", "{} -> {}".format(url, resp.status_code))
                 return out
@@ -724,11 +1012,12 @@ def collect_from_source(src, cfg):
         url = src.get("url", "")
         if not url or url.startswith("PASTE_"):
             return out
-        if not robots_allows(url, cfg):
-            audit("robots_blocked", url)
-            return out
         try:
-            resp = rate_limited_get(url, cfg)
+            resp = ethical_get(url, cfg, strict=False, conditional=True)
+            if resp is None:
+                return out                  # refused — reason already audited
+            if resp.not_modified:
+                return out                  # unchanged since the last fetch
             if resp.status_code != 200:
                 audit("fetch_failed", "{} -> {}".format(url, resp.status_code))
                 return out
@@ -768,18 +1057,462 @@ def store_job(conn, j, cfg, profile):
     return True
 
 
+def store_normalized(jobs, cfg, profile, source_label=None):
+    """Dedup + enrich + insert a list of normalized job dicts. Shared by every
+    collector (feeds, email, crawl) so all paths enrich identically. Returns
+    (added, skipped)."""
+    added = skipped = 0
+    for j in jobs:
+        if not j.get("url"):
+            skipped += 1
+            continue
+        if source_label:
+            j.setdefault("source", source_label)
+        with _db_lock, db() as conn:
+            if store_job(conn, j, cfg, profile):
+                added += 1
+            else:
+                skipped += 1
+    return added, skipped
+
+
 def collect_all(cfg):
-    added, skipped = 0, 0
+    """Run every enabled collector: configured feeds, job-alert email, and
+    careers-page crawls. All paths share dedup + enrichment, and nothing is ever
+    submitted — collection only ever stages jobs for your review."""
     profile = get_profile()
+    added = skipped = 0
     for src in cfg.get("sources", []):
-        for j in collect_from_source(src, cfg):
-            with _db_lock, db() as conn:
-                if store_job(conn, j, cfg, profile):
-                    added += 1
-                else:
-                    skipped += 1
+        a, s = store_normalized(collect_from_source(src, cfg), cfg, profile)
+        added += a
+        skipped += s
+    # Job-alert email ingestion (opt-in). Reads your mailbox read-only.
+    if (cfg.get("email_ingest") or {}).get("enabled"):
+        try:
+            a, s = store_normalized(collect_email_jobs(cfg), cfg, profile)
+            added += a
+            skipped += s
+        except Exception as e:
+            audit("email_error", str(e))
+    # Careers-page crawls (opt-in, per source).
+    for src in cfg.get("crawl_sources", []):
+        if not src.get("enabled"):
+            continue
+        try:
+            a, s = store_normalized(collect_from_crawl(src, cfg), cfg, profile)
+            added += a
+            skipped += s
+        except Exception as e:
+            audit("crawl_error", "{}: {}".format(src.get("name"), e))
     audit("collect", "added={} skipped(dupes)={}".format(added, skipped))
     return {"added": added, "skipped": skipped}
+
+
+# --------------------------------------------------------------------------- #
+# Job-alert email ingestion (IMAP / POP3 / .eml) — all parsing is local
+#
+# The boards that forbid scraping will still email you matching roles. Those
+# alerts are pushed to you, so reading them breaks no Terms of Service. RJH
+# connects read-only, parses the postings out, and — like Open-Omniscience's
+# ingest/email.py, whose approach this borrows — NEVER stores the recipient:
+# your address is read only so it can be redacted from what we keep.
+# --------------------------------------------------------------------------- #
+
+# Hosts/paths that mark a link as an actual posting rather than a footer/social
+# link. Covers common ATS vendors and multilingual "jobs/vacancy/career" paths.
+JOB_LINK_HINTS = (
+    "greenhouse.io", "lever.co", "workable.com", "smartrecruiters.com",
+    "teamtailor.com", "recruitee.com", "personio.", "ashbyhq.com", "bamboohr.com",
+    "workday", "successfactors", "icims.com", "jobvite.com", "breezy.hr",
+    "/job", "/jobs/", "/vacancy", "/vacancies", "/vacature", "/vacatures",
+    "/career", "/careers", "/stelle", "/stellen", "/emploi", "/offre",
+    "/position", "/opening", "/recruit", "/apply", "/stilling", "/jobb",
+)
+
+
+def _looks_like_job_link(url, anchor=""):
+    low = (url or "").lower()
+    if not (low.startswith("http://") or low.startswith("https://")):
+        return False
+    blob = low + " " + (anchor or "").lower()
+    return any(h in blob for h in JOB_LINK_HINTS)
+
+
+def _decode_mime_header(value):
+    """Decode an RFC 2047 header (subjects/senders) into a plain string."""
+    if not value:
+        return ""
+    parts = []
+    try:
+        for chunk, enc in decode_header(value):
+            if isinstance(chunk, bytes):
+                parts.append(chunk.decode(enc or "utf-8", "replace"))
+            else:
+                parts.append(chunk)
+    except Exception:
+        return str(value)
+    return "".join(parts).strip()
+
+
+class _AnchorParser(HTMLParser):
+    """Collects (href, anchor_text) pairs from an HTML body."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links = []
+        self._href = None
+        self._text = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self._href = dict(attrs).get("href")
+            self._text = []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._href is not None:
+            self.links.append((self._href, " ".join("".join(self._text).split())))
+            self._href = None
+            self._text = []
+
+
+def _email_body(msg):
+    """Return (text, html) for a message, decoding charsets. Prefers text/plain
+    for reading and keeps any text/html for link extraction."""
+    text_parts, html_parts = [], []
+    for part in (msg.walk() if msg.is_multipart() else [msg]):
+        if part.get_content_maintype() == "multipart":
+            continue
+        if (part.get("Content-Disposition") or "").lower().startswith("attachment"):
+            continue
+        ctype = part.get_content_type()
+        if ctype not in ("text/plain", "text/html"):
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            body = payload.decode(charset, "replace")
+        except (LookupError, ValueError):
+            body = payload.decode("utf-8", "replace")
+        (text_parts if ctype == "text/plain" else html_parts).append(body)
+    return "\n".join(text_parts), "\n".join(html_parts)
+
+
+_URL_RE = re.compile(r"https?://[^\s<>\"')]+")
+
+
+def harvest_jobs_from_email(raw_bytes, src):
+    """Parse one raw RFC822 message into a list of normalized job dicts. Links
+    are unwrapped + de-tracked; the sender becomes the source; the email date
+    becomes posted_at. The recipient is read ONLY to redact it, never stored."""
+    msg = email_lib.message_from_bytes(raw_bytes)
+    subject = _decode_mime_header(msg.get("Subject"))
+    from_name = _decode_mime_header(msg.get("From"))
+    posted_at = ""
+    try:
+        d = parsedate_to_datetime(msg.get("Date"))
+        posted_at = d.isoformat(timespec="seconds") if d else ""
+    except Exception:
+        posted_at = ""
+
+    # Recipient redaction: gather our own addresses/names so they can be scrubbed
+    # from anything we keep, then discard them.
+    recipients = set()
+    for hdr in ("To", "Cc", "Delivered-To", "X-Original-To"):
+        for _, addr in getaddresses(msg.get_all(hdr, [])):
+            if addr:
+                recipients.add(addr.lower())
+    cfg_user = (src.get("username") or "").lower()
+    if cfg_user:
+        recipients.add(cfg_user)
+
+    def redact(s):
+        out = s or ""
+        for addr in recipients:
+            if addr:
+                out = re.sub(re.escape(addr), "[you]", out, flags=re.IGNORECASE)
+                local = addr.split("@")[0]
+                if len(local) > 2:
+                    out = re.sub(r"\b" + re.escape(local) + r"\b", "[you]", out,
+                                 flags=re.IGNORECASE)
+        return out
+
+    text, html_body = _email_body(msg)
+    candidates = []                    # (url, anchor)
+    if html_body:
+        parser = _AnchorParser()
+        try:
+            parser.feed(html_body)
+            candidates.extend(parser.links)
+        except Exception:
+            pass
+    if not candidates and text:
+        candidates.extend((u, "") for u in _URL_RE.findall(text))
+
+    sender_addr = ""
+    fa = getaddresses([msg.get("From", "")])
+    if fa:
+        sender_addr = fa[0][1]
+
+    jobs, seen = [], set()
+    for href, anchor in candidates:
+        clean = sanitize_link(href)
+        if not clean or not _looks_like_job_link(clean, anchor):
+            continue
+        uh = url_hash(clean)
+        if uh in seen:
+            continue
+        seen.add(uh)
+        title = redact(anchor) or redact(subject) or "Job from email alert"
+        jobs.append({
+            "source": "Email: {}".format(sender_addr or from_name or "alert"),
+            "title": title[:300],
+            "company": "",
+            "location": "",
+            "country": src.get("default_country", ""),
+            "url": clean,
+            "description": redact(subject),
+            "posted_at": posted_at,
+        })
+    return jobs
+
+
+def _email_connection_ok(cfg_email):
+    return bool(cfg_email.get("host") and cfg_email.get("username")
+               and cfg_email.get("password"))
+
+
+def fetch_raw_emails_imap(c):
+    """Fetch raw messages over IMAP (read-only unless mark_seen). Stdlib only."""
+    use_ssl = c.get("ssl", True)
+    port = c.get("port") or (993 if use_ssl else 143)
+    M = (imaplib.IMAP4_SSL(c["host"], port) if use_ssl
+         else imaplib.IMAP4(c["host"], port))
+    raws = []
+    try:
+        M.login(c["username"], c["password"])
+        M.select(c.get("folder", "INBOX"), readonly=not c.get("mark_seen", False))
+        typ, data = M.search(None, c.get("search", "UNSEEN") or "ALL")
+        if typ != "OK":
+            return raws
+        ids = data[0].split()
+        ids = ids[-int(c.get("max_messages", 50)):]
+        fetch_flag = "(RFC822)" if c.get("mark_seen") else "(BODY.PEEK[])"
+        for mid in ids:
+            typ, mdata = M.fetch(mid, fetch_flag)
+            if typ == "OK" and mdata and mdata[0]:
+                raws.append(mdata[0][1])
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
+    return raws
+
+
+def fetch_raw_emails_pop3(c):
+    """Fetch raw messages over POP3. Stdlib only. POP3 cannot peek, but it does
+    not alter read/unread state the way IMAP does."""
+    use_ssl = c.get("ssl", True)
+    port = c.get("port") or (995 if use_ssl else 110)
+    M = (poplib.POP3_SSL(c["host"], port) if use_ssl
+         else poplib.POP3(c["host"], port))
+    raws = []
+    try:
+        M.user(c["username"])
+        M.pass_(c["password"])
+        count = len(M.list()[1])
+        start = max(1, count - int(c.get("max_messages", 50)) + 1)
+        for i in range(start, count + 1):
+            lines = M.retr(i)[1]
+            raws.append(b"\r\n".join(lines))
+    finally:
+        try:
+            M.quit()
+        except Exception:
+            pass
+    return raws
+
+
+def collect_email_jobs(cfg):
+    """Connect to the configured mailbox, parse job-alert mail, and return a
+    flat list of normalized job dicts (deduped/stored by the caller)."""
+    c = cfg.get("email_ingest") or {}
+    if not c.get("enabled") or not _email_connection_ok(c):
+        return []
+    proto = (c.get("protocol") or "imap").lower()
+    audit("email_fetch_start", "{} {}".format(proto, c.get("host", "")))
+    raws = (fetch_raw_emails_pop3(c) if proto == "pop3"
+            else fetch_raw_emails_imap(c))
+    allow = {a.lower() for a in c.get("sender_allowlist", []) if a}
+    jobs = []
+    for raw in raws:
+        try:
+            if allow:
+                msg = email_lib.message_from_bytes(raw)
+                fa = getaddresses([msg.get("From", "")])
+                sender = (fa[0][1].lower() if fa else "")
+                if sender and sender not in allow:
+                    continue
+            jobs.extend(harvest_jobs_from_email(raw, c))
+        except Exception as e:
+            audit("email_parse_error", str(e))
+    audit("email_fetch_done", "messages={} jobs_found={}".format(len(raws), len(jobs)))
+    return jobs
+
+
+def parse_eml_upload(data, cfg):
+    """Parse one or more uploaded .eml files (no mailbox needed). Accepts a single
+    raw message; returns normalized job dicts."""
+    c = cfg.get("email_ingest") or {}
+    return harvest_jobs_from_email(data, c)
+
+
+# --------------------------------------------------------------------------- #
+# Careers-page crawler (discovery) — stdlib HTML, ethical fetch, fail-closed
+#
+# Borrows the breadth-first, same-host, depth/page-capped design of
+# Open-Omniscience's ingest/crawl.py, but every fetch goes through ethical_get
+# in STRICT mode (SSRF guard + fail-closed robots + rate limit + Crawl-delay),
+# and HTML parsing is stdlib (no BeautifulSoup) so the core stays dependency-free.
+# --------------------------------------------------------------------------- #
+
+def _registrable_host(url):
+    host = (urlparse(url).netloc or "").lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+class _PageParser(HTMLParser):
+    """Pulls <a href> links, the <title>, and a rough plain-text rendering from
+    a page, skipping <script>/<style>. Good enough to discover postings and to
+    give the description a stdlib fallback when trafilatura is absent."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links = []
+        self.title = ""
+        self._in_title = False
+        self._skip = 0
+        self._text = []
+        self._a_href = None
+        self._a_text = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "noscript"):
+            self._skip += 1
+        elif tag == "title":
+            self._in_title = True
+        elif tag == "a":
+            self._a_href = dict(attrs).get("href")
+            self._a_text = []
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "noscript") and self._skip:
+            self._skip -= 1
+        elif tag == "title":
+            self._in_title = False
+        elif tag == "a" and self._a_href is not None:
+            self.links.append((self._a_href,
+                               " ".join("".join(self._a_text).split())))
+            self._a_href = None
+            self._a_text = []
+
+    def handle_data(self, data):
+        if self._skip:
+            return
+        if self._in_title:
+            self.title += data
+        if self._a_href is not None:
+            self._a_text.append(data)
+        s = data.strip()
+        if s:
+            self._text.append(s)
+
+    def text(self):
+        return re.sub(r"\s+\n", "\n", " ".join(self._text))
+
+
+def html_to_text(html_str, url=None):
+    """Best-effort clean text + title from a page. Uses trafilatura when it is
+    installed (cleaner article body), else a stdlib HTML-to-text fallback."""
+    title, body = "", ""
+    if TRAFILATURA_AVAILABLE:
+        try:
+            body = trafilatura.extract(html_str, favor_recall=False,
+                                       include_comments=False,
+                                       include_tables=False, url=url) or ""
+        except Exception:
+            body = ""
+    parser = _PageParser()
+    try:
+        parser.feed(html_str)
+    except Exception:
+        pass
+    title = " ".join(parser.title.split())
+    if not body:
+        body = parser.text()
+    return title, body, parser.links
+
+
+def collect_from_crawl(src, cfg):
+    """Breadth-first crawl of one careers page/site. Returns normalized job dicts
+    for the pages that look like individual postings. Honours robots.txt
+    (fail-closed), the per-domain rate limit, same-host scope, and depth/page
+    caps. Never submits anything — it only discovers and stages postings."""
+    start = src.get("url", "")
+    if not start or start.startswith("https://careers.example.com"):
+        return []
+    max_depth = int(src.get("max_depth", 1))
+    max_pages = int(src.get("max_pages", 40))
+    same_host = src.get("same_host", True)
+    root_host = _registrable_host(start)
+
+    seen = set()
+    queue = deque([(canonicalize_url(start), 0)])
+    seen.add(canonicalize_url(start))
+    pages = 0
+    jobs = []
+    audit("crawl_start", "{} (depth<={}, pages<={})".format(start, max_depth, max_pages))
+    while queue and pages < max_pages:
+        url, depth = queue.popleft()
+        resp = ethical_get(url, cfg, strict=True, conditional=True)
+        if resp is None:
+            continue                       # blocked/refused — reason audited
+        pages += 1
+        if resp.not_modified or resp.status_code != 200:
+            continue
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if "html" not in ctype and "xml" not in ctype:
+            continue
+        title, body, links = html_to_text(resp.text, url=url)
+        # Treat this page as a posting if its own URL looks like one.
+        if _looks_like_job_link(url, title) and title:
+            jobs.append({
+                "source": src.get("name", "Crawl"),
+                "title": title[:300],
+                "company": "",
+                "location": "",
+                "country": src.get("default_country", ""),
+                "url": url,
+                "description": (body or "")[:8000],
+                "posted_at": "",
+            })
+        if depth >= max_depth:
+            continue
+        for href, anchor in links:
+            nxt = sanitize_link(href, base=url)
+            if not nxt or nxt in seen:
+                continue
+            if same_host and _registrable_host(nxt) != root_host:
+                continue
+            seen.add(nxt)
+            queue.append((nxt, depth + 1))
+    audit("crawl_done", "{}: pages={} postings={}".format(
+        src.get("name", "Crawl"), pages, len(jobs)))
+    return jobs
 
 
 # --------------------------------------------------------------------------- #
@@ -1088,6 +1821,115 @@ def generate_documents(job, profile, cfg):
 
 
 # --------------------------------------------------------------------------- #
+# Optional local-LLM analysis: keyword/entity extraction, translation, and an
+# honest fit summary. Mirrors Open-Omniscience's ai_layer/extract.py +
+# translate.py — stdlib-only logic over an injected client (here, ollama_chat) —
+# so it reuses RJH's existing local model and adds no dependency.
+# --------------------------------------------------------------------------- #
+
+def _parse_terms(raw, limit=15):
+    """One term per line -> a clean, de-duplicated list. Strips list markers,
+    drops over-long lines (probably prose, not a term), caps the count."""
+    out, seen = [], set()
+    for line in (raw or "").splitlines():
+        t = re.sub(r"^[\s\-\*\d\.\)•]+", "", line).strip().strip('"').strip()
+        if not t or len(t) > 80:
+            continue
+        low = t.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(t)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def llm_extract_terms(job, cfg, max_items=15):
+    """Salient skills/tools/entities a posting names, via the local model."""
+    text = (job.get("title", "") + "\n" + job.get("description", ""))[:6000]
+    system = ("You extract the key skills, tools, certifications and named "
+              "entities a job posting mentions. Output ONLY the terms, one per "
+              "line, no numbering, no commentary. Use the posting's own wording.")
+    raw = ollama_chat(cfg, system, text)
+    return _parse_terms(raw, max_items)
+
+
+def llm_translate(job, cfg, target=None):
+    """Translate a posting's title + description into the target language so a
+    user can read non-English roles. Returns "" if it is already in target."""
+    if not target:
+        lang = cfg.get("output_language", "auto")
+        target = "English" if lang in ("", "auto") else lang
+    text = (job.get("title", "") + "\n\n" + job.get("description", ""))[:6000]
+    system = ("You are a professional translator. Translate the job posting into "
+              "{0}. Preserve meaning and tone; do not summarize or add anything. "
+              "If it is already in {0}, return it unchanged.").format(target)
+    return ollama_chat(cfg, system, text).strip()
+
+
+def llm_summarize_fit(job, profile, cfg):
+    """A short, honest read on how this role fits the candidate's REAL resume —
+    grounded only in the master resume, never inventing experience."""
+    system = ("You are a candid career advisor. In 2-4 sentences, assess how well "
+              "this role fits the candidate, grounded ONLY in their real master "
+              "resume. Name concrete matches and gaps. Never invent experience. "
+              "Be honest, not flattering.")
+    user = ("MASTER RESUME:\n{resume}\n\nROLE: {title} at {company}\n"
+            "DESCRIPTION:\n{desc}").format(
+                resume=profile.get("resume", "")[:6000],
+                title=job.get("title", ""), company=job.get("company", ""),
+                desc=job.get("description", "")[:4000])
+    return ollama_chat(cfg, system, user).strip()
+
+
+def analyze_job(job, profile, cfg, want=("terms", "translation", "summary")):
+    """Run the requested local-LLM analyses for one job, persist them, return
+    them. Each piece is independent so a single failure cannot lose the rest."""
+    terms, translation, summary = [], "", ""
+    if "terms" in want:
+        try:
+            terms = llm_extract_terms(job, cfg)
+        except Exception as e:
+            audit("analyze_error", "terms job_id={}: {}".format(job.get("id"), e))
+    if "translation" in want:
+        try:
+            translation = llm_translate(job, cfg)
+        except Exception as e:
+            audit("analyze_error", "translate job_id={}: {}".format(job.get("id"), e))
+    if "summary" in want:
+        try:
+            summary = llm_summarize_fit(job, profile, cfg)
+        except Exception as e:
+            audit("analyze_error", "summary job_id={}: {}".format(job.get("id"), e))
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    with _db_lock, db() as conn:
+        conn.execute(
+            "INSERT INTO analysis (job_id,terms,translation,summary,model,created_at) "
+            "VALUES (?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET "
+            "terms=excluded.terms, translation=excluded.translation, "
+            "summary=excluded.summary, model=excluded.model, "
+            "created_at=excluded.created_at",
+            (job["id"], ", ".join(terms), translation, summary,
+             cfg.get("ollama_model", ""), now))
+    audit("analyze", "job_id={} terms={}".format(job["id"], len(terms)))
+    return {"terms": terms, "translation": translation, "summary": summary}
+
+
+def get_analysis(job_id):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT terms, translation, summary, model, created_at "
+            "FROM analysis WHERE job_id = ?", (job_id,)).fetchone()
+    if not row:
+        return {"terms": [], "translation": "", "summary": "", "model": "",
+                "created_at": ""}
+    return {"terms": [t.strip() for t in (row["terms"] or "").split(",") if t.strip()],
+            "translation": row["translation"] or "", "summary": row["summary"] or "",
+            "model": row["model"] or "", "created_at": row["created_at"] or ""}
+
+
+# --------------------------------------------------------------------------- #
 # Resume import (PDF / ODT / TXT / Markdown) — all parsing is local
 # --------------------------------------------------------------------------- #
 
@@ -1129,6 +1971,181 @@ def extract_resume_text(filename, data):
         return _extract_odt(data)
     return None, ("Unsupported file type '.{}'. Use PDF, ODT, TXT, or MD.".format(ext)
                   if ext else "File has no extension; use PDF, ODT, TXT, or MD.")
+
+
+# --------------------------------------------------------------------------- #
+# ODF (.odt) document compiler — turn tailored resume / cover-letter TEXT into a
+# formatted OpenDocument file. Pure stdlib (zipfile + hand-written ODF XML), so
+# it works fully offline with NO third-party packages: an .odt is just a ZIP of
+# a few XML parts. (odfpy is used only for READING imported resumes, never here.)
+# --------------------------------------------------------------------------- #
+
+ODT_MIMETYPE = "application/vnd.oasis.opendocument.text"
+
+_ODT_NS = ('xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+           'xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" '
+           'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" '
+           'xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"')
+
+_ODT_MANIFEST = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0"'
+    ' manifest:version="1.2">'
+    '<manifest:file-entry manifest:full-path="/" manifest:media-type="' + ODT_MIMETYPE + '"/>'
+    '<manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>'
+    '<manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/>'
+    '<manifest:file-entry manifest:full-path="meta.xml" manifest:media-type="text/xml"/>'
+    '</manifest:manifest>')
+
+_ODT_STYLES = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<office:document-styles ' + _ODT_NS + ' office:version="1.2"><office:styles>'
+    '<style:default-style style:family="paragraph">'
+    '<style:text-properties fo:font-size="11pt" fo:font-family="Arial"/></style:default-style>'
+    '<style:style style:name="Standard" style:family="paragraph"/>'
+    '<style:style style:name="Title" style:family="paragraph" style:parent-style-name="Standard">'
+    '<style:paragraph-properties fo:text-align="center" fo:margin-bottom="0.05in"/>'
+    '<style:text-properties fo:font-size="22pt" fo:font-weight="bold"/></style:style>'
+    '<style:style style:name="Contact" style:family="paragraph" style:parent-style-name="Standard">'
+    '<style:paragraph-properties fo:text-align="center" fo:margin-bottom="0.2in"/>'
+    '<style:text-properties fo:font-size="10pt" fo:color="#555555"/></style:style>'
+    '<style:style style:name="Meta" style:family="paragraph" style:parent-style-name="Standard">'
+    '<style:paragraph-properties fo:text-align="right" fo:margin-bottom="0.12in"/>'
+    '<style:text-properties fo:font-size="10pt" fo:color="#555555"/></style:style>'
+    '<style:style style:name="Heading1" style:family="paragraph" style:parent-style-name="Standard">'
+    '<style:paragraph-properties fo:margin-top="0.16in" fo:margin-bottom="0.04in"'
+    ' fo:border-bottom="0.5pt solid #999999" fo:padding-bottom="0.02in"/>'
+    '<style:text-properties fo:font-size="13pt" fo:font-weight="bold" fo:color="#222222"/></style:style>'
+    '<style:style style:name="Body" style:family="paragraph" style:parent-style-name="Standard">'
+    '<style:paragraph-properties fo:margin-bottom="0.06in" fo:line-height="115%"/></style:style>'
+    '<text:list-style style:name="Bullets">'
+    '<text:list-level-style-bullet text:level="1" text:bullet-char="•">'
+    '<style:list-level-properties text:space-before="0.2in" text:min-label-width="0.15in"/>'
+    '</text:list-level-style-bullet></text:list-style>'
+    '</office:styles></office:document-styles>')
+
+_ODT_CONTENT = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<office:document-content ' + _ODT_NS + ' office:version="1.2">'
+    '<office:automatic-styles/><office:body><office:text>{body}</office:text>'
+    '</office:body></office:document-content>')
+
+_ODT_META = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"'
+    ' xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0"'
+    ' xmlns:dc="http://purl.org/dc/elements/1.1/" office:version="1.2"><office:meta>'
+    '<meta:generator>RJH - Reverse Job Hunting</meta:generator>'
+    '<dc:title>{title}</dc:title><meta:creation-date>{iso}</meta:creation-date>'
+    '</office:meta></office:document-meta>')
+
+# Section labels that should render as headings, and the bullet-line shape.
+_ODT_SECTION_RE = re.compile(
+    r"^(summary|profile|objective|professional summary|experience|work experience|"
+    r"employment( history)?|education|skills|core competenc(?:e|ie)s|competenc(?:e|ie)s|"
+    r"projects|certifications?|publications?|languages?|contact|references|"
+    r"achievements|awards|interests|volunteering)\b:?$", re.IGNORECASE)
+_ODT_BULLET_RE = re.compile(r"^\s*[-*•–·]\s+(.*)$")
+
+
+def _odt_esc(s):
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _odt_p(text, style="Body"):
+    return '<text:p text:style-name="{}">{}</text:p>'.format(style, _odt_esc(text))
+
+
+def _odt_h(text, style="Heading1"):
+    return ('<text:h text:style-name="{}" text:outline-level="1">{}</text:h>'
+            .format(style, _odt_esc(text)))
+
+
+def _odt_bullets(items):
+    lis = "".join('<text:list-item>{}</text:list-item>'.format(_odt_p(i))
+                  for i in items)
+    return '<text:list text:style-name="Bullets">{}</text:list>'.format(lis)
+
+
+def _format_body_xml(text):
+    """Render plain text into ODF paragraphs, headings and bullet lists with a
+    light, conservative heuristic. The text stays the source of truth — this is
+    purely presentation, so a missed heading just renders as a paragraph."""
+    out, bullets = [], []
+
+    def flush():
+        if bullets:
+            out.append(_odt_bullets(list(bullets)))
+            bullets.clear()
+
+    for raw in (text or "").splitlines():
+        s = raw.strip()
+        if not s:
+            flush()
+            continue
+        mb = _ODT_BULLET_RE.match(raw)
+        if mb:
+            bullets.append(mb.group(1).strip())
+            continue
+        flush()
+        is_heading = (len(s) <= 60 and not s.endswith((".", "!", "?")) and
+                      (bool(_ODT_SECTION_RE.match(s)) or s.endswith(":") or
+                       (s.isupper() and any(c.isalpha() for c in s))))
+        out.append(_odt_h(s.rstrip(":")) if is_heading else _odt_p(s))
+    flush()
+    return "".join(out) if out else '<text:p text:style-name="Standard"/>'
+
+
+def _zip_odt(content_xml, styles_xml, meta_xml, manifest_xml):
+    """Pack the parts into a valid .odt: mimetype FIRST and STORED, rest deflated."""
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        zi = zipfile.ZipInfo("mimetype")
+        zi.compress_type = zipfile.ZIP_STORED
+        z.writestr(zi, ODT_MIMETYPE.encode("ascii"))
+        z.writestr("META-INF/manifest.xml", manifest_xml)
+        z.writestr("content.xml", content_xml)
+        z.writestr("styles.xml", styles_xml)
+        z.writestr("meta.xml", meta_xml)
+    return buf.getvalue()
+
+
+def compile_document_odt(kind, text, profile, job=None):
+    """Compile a tailored resume or cover letter (kind = 'resume' |
+    'cover_letter') from its text plus the profile's contact details into .odt
+    bytes. `job` adds a subject line to a cover letter when available."""
+    profile = profile or {}
+    name = (profile.get("name") or "Candidate").strip()
+    contact = [b for b in (profile.get("email"), profile.get("phone"),
+                           profile.get("location"), profile.get("linkedin")) if b]
+    parts = [_odt_p(name, "Title")]
+    if contact:
+        parts.append(_odt_p("  ·  ".join(contact), "Contact"))
+    if kind == "cover_letter":
+        now = dt.datetime.now()
+        parts.append(_odt_p("{} {} {}".format(now.day, now.strftime("%B"), now.year),
+                            "Meta"))
+        if job and (job.get("title") or job.get("company")):
+            subj = "Re: " + " — ".join(
+                [x for x in (job.get("title"), job.get("company")) if x])
+            parts.append(_odt_h(subj))
+    parts.append(_format_body_xml(text))
+    content = _ODT_CONTENT.format(body="".join(parts))
+    title = "{} - {}".format(name, "Cover Letter" if kind == "cover_letter"
+                             else "Resume")
+    meta = _ODT_META.format(title=_odt_esc(title),
+                            iso=dt.datetime.now().isoformat(timespec="seconds"))
+    return _zip_odt(content, _ODT_STYLES, meta, _ODT_MANIFEST)
+
+
+def odt_filename(kind, profile, job=None):
+    """A tidy download name like 'Jane_Doe_Acme_Resume.odt'."""
+    stem_bits = [(profile or {}).get("name") or "RJH"]
+    if job and job.get("company"):
+        stem_bits.append(job["company"])
+    stem_bits.append("CoverLetter" if kind == "cover_letter" else "Resume")
+    stem = re.sub(r"[^A-Za-z0-9]+", "_", " ".join(stem_bits)).strip("_") or "document"
+    return stem + ".odt"
 
 
 # --------------------------------------------------------------------------- #
@@ -1256,6 +2273,143 @@ def build_import_template(fmt):
 
 
 # --------------------------------------------------------------------------- #
+# Background scheduler (automation) — stdlib daemon thread
+#
+# Borrows the shape of Open-Omniscience's scheduler/runner.py: one daemon
+# thread, an interval, an interruptible wait, and a non-overlapping "run now".
+# Each pass runs the same collect -> enrich -> (optional) draft pipeline you can
+# run by hand, then STAGES everything for review. It never submits an
+# application — the final click is always yours, exactly as before.
+# --------------------------------------------------------------------------- #
+
+class BackgroundScheduler:
+    def __init__(self):
+        self._thread = None
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._run_lock = threading.Lock()      # guarantees non-overlapping runs
+        self.running = False
+        self.last_result = None
+
+    def start(self):
+        if self.running:
+            return
+        self._stop.clear()
+        self.running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        audit("scheduler_start", "")
+
+    def stop(self):
+        if not self.running:
+            return
+        self._stop.set()
+        self._wake.set()
+        self.running = False
+        audit("scheduler_stop", "")
+
+    def run_now(self):
+        """Trigger one pass immediately, off the periodic schedule. Safe to call
+        whether or not the periodic loop is running; the run lock prevents
+        overlap."""
+        threading.Thread(target=lambda: self._do_run(load_config()),
+                         daemon=True).start()
+
+    @staticmethod
+    def _interval_seconds(cfg):
+        try:
+            return max(60, int((cfg.get("scheduler") or {}).get(
+                "interval_minutes", 60)) * 60)
+        except Exception:
+            return 3600
+
+    def _loop(self):
+        while not self._stop.is_set():
+            cfg = load_config()
+            if (cfg.get("scheduler") or {}).get("enabled"):
+                self._do_run(cfg)
+            self._wake.clear()
+            self._wake.wait(self._interval_seconds(load_config()))
+
+    def _do_run(self, cfg):
+        if not self._run_lock.acquire(blocking=False):
+            return                              # a pass is already running
+        started = dt.datetime.now().isoformat(timespec="seconds")
+        added = skipped = generated = 0
+        err = ""
+        try:
+            res = collect_all(cfg)
+            added, skipped = res.get("added", 0), res.get("skipped", 0)
+            sc = cfg.get("scheduler") or {}
+            if sc.get("auto_generate") and cfg.get("llm_enabled", True):
+                generated = self._auto_generate(cfg, sc)
+        except Exception as e:
+            err = str(e)
+            audit("scheduler_error", err)
+        finally:
+            self._run_lock.release()
+        finished = dt.datetime.now().isoformat(timespec="seconds")
+        self.last_result = {"started_at": started, "finished_at": finished,
+                            "added": added, "skipped": skipped,
+                            "generated": generated, "error": err}
+        with _db_lock, db() as conn:
+            conn.execute(
+                "INSERT INTO scheduler_runs "
+                "(started_at,finished_at,added,skipped,generated,error) "
+                "VALUES (?,?,?,?,?,?)",
+                (started, finished, added, skipped, generated, err))
+        audit("scheduler_run", "added={} generated={} err={}".format(
+            added, generated, err or "-"))
+
+    def _auto_generate(self, cfg, sc):
+        """Draft documents for the top NEW matches. Needs Ollama up. Drafting
+        only stages documents — it never submits."""
+        if not ollama_status(cfg).get("up"):
+            return 0
+        min_score = int(sc.get("auto_generate_min_score", 75))
+        max_n = int(sc.get("auto_generate_max_per_run", 3))
+        profile = get_profile()
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE status = 'new' AND score >= ? "
+                "ORDER BY score DESC LIMIT ?", (min_score, max_n)).fetchall()
+        n = 0
+        for r in rows:
+            try:
+                generate_documents(dict(r), profile, cfg)
+                n += 1
+            except Exception as e:
+                audit("scheduler_gen_error", "job_id={}: {}".format(r["id"], e))
+        return n
+
+
+scheduler = BackgroundScheduler()
+
+
+def reconcile_scheduler(cfg=None):
+    """Start or stop the background thread to match the saved config."""
+    cfg = cfg or load_config()
+    want = bool((cfg.get("scheduler") or {}).get("enabled"))
+    if want and not scheduler.running:
+        scheduler.start()
+    elif not want and scheduler.running:
+        scheduler.stop()
+
+
+def scheduler_status():
+    cfg = load_config()
+    sc = cfg.get("scheduler") or {}
+    with db() as conn:
+        history = [dict(r) for r in conn.execute(
+            "SELECT started_at,finished_at,added,skipped,generated,error "
+            "FROM scheduler_runs ORDER BY id DESC LIMIT 10").fetchall()]
+    return {"running": scheduler.running, "enabled": bool(sc.get("enabled")),
+            "interval_minutes": sc.get("interval_minutes", 60),
+            "auto_generate": bool(sc.get("auto_generate")),
+            "last_result": scheduler.last_result, "history": history}
+
+
+# --------------------------------------------------------------------------- #
 # Per-site pre-fill engine (two layers; NEVER submits)
 # --------------------------------------------------------------------------- #
 
@@ -1347,18 +2501,40 @@ def _write_tmp(name, content):
     return path
 
 
+def _write_tmp_bytes(name, data):
+    os.makedirs(TMP_DIR, exist_ok=True)
+    path = os.path.join(TMP_DIR, name)
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
+def _generated_upload(kind, text, profile):
+    """Compile the generated text into a temp .odt to attach during pre-fill,
+    falling back to a plain .txt if compilation fails for any reason."""
+    if not text:
+        return None
+    base = "RJH_resume" if kind == "resume" else "RJH_cover_letter"
+    try:
+        return _write_tmp_bytes(base + ".odt",
+                                compile_document_odt(kind, text, profile))
+    except Exception as e:
+        audit("odt_compile_error", "{}: {}".format(kind, e))
+        return _write_tmp(base + ".txt", text)
+
+
 def resolve_upload_path(kind, profile, resume_text, cover_text):
-    """Prefer a curated PDF path from the profile if it exists; otherwise fall
-    back to a temp .txt of the generated document."""
+    """Prefer a curated file from the profile if it exists; otherwise attach a
+    freshly compiled .odt of the generated document (a .txt if that fails)."""
     if kind == "resume":
         p = profile.get("resume_file", "")
         if p and os.path.exists(p):
             return p
-        return _write_tmp("RJH_resume.txt", resume_text or "")
+        return _generated_upload("resume", resume_text, profile)
     p = profile.get("cover_letter_file", "")
     if p and os.path.exists(p):
         return p
-    return _write_tmp("RJH_cover_letter.txt", cover_text or "")
+    return _generated_upload("cover_letter", cover_text, profile)
 
 
 def prefill_application(job_id, job_url, cfg):
@@ -1672,6 +2848,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button class="btn sec" id="rescoreBtn" title="Recompute score, salary and competencies for all stored jobs">Re-score all</button>
       <input type="file" id="importJobsFile" accept=".csv,.json,.tsv" class="hide"/>
       <button class="btn sec" id="importJobsBtn" title="Import job listings from a CSV or JSON file">Import jobs…</button>
+      <input type="file" id="importEmailFile" accept=".eml" class="hide"/>
+      <button class="btn sec" id="importEmailBtn" title="Ingest a saved job-alert email (.eml) — parsed locally, no mailbox needed">Import .eml…</button>
       <a class="btn sec" href="/api/import_template?format=csv" title="Download a sample CSV showing the expected columns">CSV template</a>
       <a class="btn sec" href="/api/import_template?format=json" title="Download a sample JSON file">JSON template</a>
       <a class="btn sec" href="/api/export?format=csv">Export CSV</a>
@@ -1705,16 +2883,26 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button class="btn sec" id="regenBtn">Regenerate</button></div>
     <label>Tailored resume</label>
     <textarea id="resumeBox"></textarea>
-    <div class="row"><button class="btn sec" onclick="copyBox('resumeBox')">Copy resume</button></div>
+    <div class="row"><button class="btn sec" onclick="copyBox('resumeBox')">Copy resume</button>
+      <button class="btn sec" id="dlResumeOdt" title="Compile a formatted OpenDocument (.odt) resume">Download .odt</button></div>
     <label>Cover letter</label>
     <textarea id="coverBox"></textarea>
     <div class="row">
       <button class="btn sec" onclick="copyBox('coverBox')">Copy cover letter</button>
+      <button class="btn sec" id="dlCoverOdt" title="Compile a formatted OpenDocument (.odt) cover letter">Download .odt</button>
       <button class="btn sec" id="saveDocsBtn">Save edits</button>
       <button class="btn" id="prefillBtn" style="margin-left:auto">Pre-fill application (you submit)</button>
     </div>
     <div class="hint">Edits are saved locally and used during pre-fill. Pre-fill opens a real
       browser, fills what it can, and stops — you review and submit yourself.</div>
+    <div id="analysisBlock" class="hide" style="margin-top:16px;border-top:1px solid var(--line);padding-top:12px">
+      <div class="group-title">AI analysis <span class="muted" id="analysisMeta" style="font-weight:400"></span></div>
+      <div id="analysisTerms" class="tags" style="max-width:none;margin-bottom:8px"></div>
+      <label>Fit summary — honest, grounded only in your resume</label>
+      <textarea id="analysisSummary" readonly style="min-height:80px"></textarea>
+      <label>Translation of the posting</label>
+      <textarea id="analysisTranslation" readonly style="min-height:120px"></textarea>
+    </div>
   </div>
 </section>
 
@@ -1811,6 +2999,70 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="hint">The pre-fill step drives this browser engine. Install it once with
       <code>playwright install firefox</code> (or chromium / webkit).</div>
+  </div>
+  <div class="card">
+    <div class="group-title">Automation — background scheduler</div>
+    <div class="banner" style="margin:0 0 10px">🔒 The scheduler only ever <b>collects and stages</b>
+      jobs (and, optionally, drafts documents). It never submits — the final click stays yours.</div>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+      <input type="checkbox" id="cSchedEnabled" style="width:auto"/>
+      Run collection automatically on an interval
+    </label>
+    <div class="grid3" style="margin-top:8px">
+      <div><label>Interval (minutes)</label><input id="cSchedInterval" type="number" min="1" style="width:100%"/></div>
+      <div><label>Auto-draft min score</label><input id="cSchedMinScore" type="number" min="0" max="100" style="width:100%"/></div>
+      <div><label>Max drafts per run</label><input id="cSchedMaxGen" type="number" min="0" style="width:100%"/></div>
+    </div>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:10px">
+      <input type="checkbox" id="cSchedAutoGen" style="width:auto"/>
+      Auto-draft resume &amp; cover letter for top new matches (needs Ollama, AI tools on)
+    </label>
+    <div class="row" style="margin-top:10px">
+      <button class="btn sec" id="schedRunNowBtn">Run a pass now</button>
+      <span class="muted" id="schedStatus">—</span>
+    </div>
+    <div class="hint">Saved with <b>Save settings</b>; toggling the box starts or stops the
+      background thread immediately. A pass runs every enabled source — feeds, email and crawls.</div>
+  </div>
+  <div class="card">
+    <div class="group-title">Job-alert email ingestion</div>
+    <p class="muted" style="margin:0 0 8px">Boards that forbid scraping will still email you matching
+      roles. RJH reads your mailbox <b>read-only</b>, parses the postings out, and never stores your
+      address. Credentials are kept locally in <code>config.json</code> — use an app password.</p>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+      <input type="checkbox" id="cEmailEnabled" style="width:auto"/> Enable email ingestion
+    </label>
+    <div class="grid3" style="margin-top:8px">
+      <div><label>Protocol</label>
+        <select id="cEmailProto" style="width:100%"><option value="imap">IMAP</option>
+        <option value="pop3">POP3</option></select></div>
+      <div><label>Host</label><input id="cEmailHost" placeholder="imap.example.com" style="width:100%"/></div>
+      <div><label>Port (0 = default)</label><input id="cEmailPort" type="number" style="width:100%"/></div>
+    </div>
+    <div class="grid3" style="margin-top:8px">
+      <div><label>Username</label><input id="cEmailUser" autocomplete="off" style="width:100%"/></div>
+      <div><label>Password / app password</label><input id="cEmailPass" type="password" autocomplete="new-password" style="width:100%"/></div>
+      <div><label>Default country (ISO-2)</label><input id="cEmailCountry" style="width:100%"/></div>
+    </div>
+    <div class="grid3" style="margin-top:8px">
+      <div><label>Folder (IMAP)</label><input id="cEmailFolder" style="width:100%"/></div>
+      <div><label>Search (IMAP, e.g. UNSEEN / ALL)</label><input id="cEmailSearch" style="width:100%"/></div>
+      <div><label>Max messages</label><input id="cEmailMax" type="number" style="width:100%"/></div>
+    </div>
+    <label style="margin-top:8px">Sender allowlist (comma separated, optional)</label>
+    <input id="cEmailSenders" style="width:100%" placeholder="jobalerts-noreply@linkedin.com, alert@indeed.com"/>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:10px">
+      <input type="checkbox" id="cEmailMarkSeen" style="width:auto"/> Mark fetched mail as read (IMAP)
+    </label>
+    <div class="row" style="margin-top:10px"><button class="btn sec" id="fetchEmailBtn">Fetch from mailbox now</button>
+      <span class="muted">…or use <b>Import .eml…</b> on the Jobs tab with no mailbox at all.</span></div>
+  </div>
+  <div class="card">
+    <div class="group-title">Careers-page crawler (JSON)</div>
+    <p class="muted" style="margin:0 0 8px">Point at a careers page or ATS; RJH discovers individual
+      postings, staying on the same site, honouring robots.txt (fail-closed) and the rate limit, up to
+      the depth/page caps. All entries ship disabled — prefer an official feed or emailed alert where one exists.</p>
+    <textarea id="cCrawl" style="min-height:150px"></textarea>
   </div>
   <div class="card">
     <div class="group-title">Sources (JSON)</div>
@@ -1996,6 +3248,7 @@ async function loadJobs(){
     const genLabel=hasDocs?'Regenerate':'Generate';
     const aiBtns = llmEnabled
       ? `<button class="btn" data-gen="${j.id}">${genLabel}</button>`
+        +`<button class="btn sec" data-analyze="${j.id}" title="Local-LLM keywords, translation and an honest fit summary">Analyze</button>`
         +(hasDocs?`<button class="btn sec" data-docs="${j.id}">Open docs</button>`:'')
       : '';
     const tr=document.createElement('tr');
@@ -2015,6 +3268,7 @@ async function loadJobs(){
     body.appendChild(tr);
   });
   body.querySelectorAll('[data-gen]').forEach(b=>b.onclick=()=>generate(b.dataset.gen));
+  body.querySelectorAll('[data-analyze]').forEach(b=>b.onclick=()=>analyze(b.dataset.analyze));
   body.querySelectorAll('[data-docs]').forEach(b=>b.onclick=()=>openExisting(b.dataset.docs));
   body.querySelectorAll('[data-short]').forEach(b=>b.onclick=()=>setStatus(b.dataset.short,'shortlisted'));
   body.querySelectorAll('[data-arch]').forEach(b=>b.onclick=()=>setStatus(b.dataset.arch,'archived'));
@@ -2055,8 +3309,38 @@ function openDocs(job,resume,cover){
   document.getElementById('docsMeta').textContent=statusLabel(job.status);
   document.getElementById('resumeBox').value=resume||'';
   document.getElementById('coverBox').value=cover||'';
+  loadAnalysis(job.id);
 }
 function statusLabel(s){return s?('status: '+s):'';}
+
+function renderAnalysis(a){
+  const block=document.getElementById('analysisBlock');
+  const has=(a.terms&&a.terms.length)||(a.summary||'').trim()||(a.translation||'').trim();
+  block.classList.toggle('hide',!has);
+  if(!has)return;
+  document.getElementById('analysisTerms').innerHTML=(a.terms||[])
+    .map(t=>'<span class="tag">'+esc(t)+'</span>').join('');
+  document.getElementById('analysisSummary').value=a.summary||'';
+  document.getElementById('analysisTranslation').value=a.translation||'';
+  document.getElementById('analysisMeta').textContent=
+    a.created_at?('· '+(a.model||'')+' · '+a.created_at):'';
+}
+async function loadAnalysis(id){
+  try{renderAnalysis(await api('/api/analysis/'+id));}
+  catch(e){document.getElementById('analysisBlock').classList.add('hide');}
+}
+async function analyze(id){
+  showOverlay('Analyzing locally with Ollama…',
+    'Keyword/entity extraction, translation and an honest fit summary — all on your machine.');
+  try{
+    const r=await api('/api/analyze/'+id,{method:'POST'});
+    let docs={};try{docs=await api('/api/documents/'+id);}catch(e){}
+    openDocs(jobsCache[id],docs.resume,docs.cover_letter);
+    renderAnalysis(r);
+    toast('Analysis ready','ok');
+  }catch(e){toast('Analysis failed. Is Ollama running and a model pulled?','err');}
+  finally{hideOverlay();}
+}
 
 async function saveDocs(silent){
   if(!currentJob)return false;
@@ -2072,6 +3356,16 @@ async function saveDocs(silent){
 
 document.getElementById('saveDocsBtn').onclick=()=>saveDocs(false);
 document.getElementById('regenBtn').onclick=()=>{if(currentJob)generate(currentJob.id);};
+async function downloadOdt(kind){
+  if(!currentJob)return;
+  const box=document.getElementById(kind==='resume'?'resumeBox':'coverBox');
+  if(!box.value.trim())return toast('Nothing to compile yet','err');
+  await saveDocs(true);                       // compile from your latest edits
+  window.location='/api/documents/'+currentJob.id+'/odt?kind='+kind;
+  toast('Compiling .odt…','ok');
+}
+document.getElementById('dlResumeOdt').onclick=()=>downloadOdt('resume');
+document.getElementById('dlCoverOdt').onclick=()=>downloadOdt('cover_letter');
 document.getElementById('prefillBtn').onclick=async()=>{
   if(!currentJob)return;
   if(!confirm('This opens a real browser and pre-fills what it can. It will NOT submit. '
@@ -2114,6 +3408,19 @@ document.getElementById('importJobsFile').onchange=async(ev)=>{
     const j=await r.json();
     if(!r.ok||!j.ok){toast(j.error||'Import failed','err');return;}
     toast('Imported '+j.added+', skipped '+j.skipped+' of '+j.total,'ok');loadJobs();
+  }catch(e){toast('Import failed: '+e.message,'err');}
+  finally{hideOverlay();ev.target.value='';}
+};
+document.getElementById('importEmailBtn').onclick=()=>document.getElementById('importEmailFile').click();
+document.getElementById('importEmailFile').onchange=async(ev)=>{
+  const f=ev.target.files[0];if(!f)return;
+  showOverlay('Reading '+f.name+'…','Parsing the alert locally — nothing is uploaded.');
+  try{
+    const buf=await f.arrayBuffer();
+    const r=await fetch('/api/import_email',{method:'POST',body:buf});
+    const j=await r.json();
+    if(!r.ok||!j.ok){toast(j.error||'Import failed','err');return;}
+    toast('Found '+j.total+' link(s): added '+j.added+', skipped '+j.skipped,'ok');loadJobs();
   }catch(e){toast('Import failed: '+e.message,'err');}
   finally{hideOverlay();ev.target.value='';}
 };
@@ -2177,23 +3484,96 @@ async function loadSettings(){
   cSources.value=JSON.stringify(c.sources,null,2);
   cMappings.value=JSON.stringify(c.site_mappings,null,2);
   document.getElementById('cLlmEnabled').checked=c.llm_enabled!==false;
+  // Email ingestion
+  const e=c.email_ingest||{};
+  document.getElementById('cEmailEnabled').checked=!!e.enabled;
+  document.getElementById('cEmailProto').value=e.protocol||'imap';
+  document.getElementById('cEmailHost').value=e.host||'';
+  document.getElementById('cEmailPort').value=e.port||0;
+  document.getElementById('cEmailUser').value=e.username||'';
+  document.getElementById('cEmailPass').value=e.password||'';
+  document.getElementById('cEmailCountry').value=e.default_country||'';
+  document.getElementById('cEmailFolder').value=e.folder||'INBOX';
+  document.getElementById('cEmailSearch').value=e.search||'UNSEEN';
+  document.getElementById('cEmailMax').value=e.max_messages||50;
+  document.getElementById('cEmailSenders').value=(e.sender_allowlist||[]).join(', ');
+  document.getElementById('cEmailMarkSeen').checked=!!e.mark_seen;
+  // Crawler (JSON)
+  cCrawl.value=JSON.stringify(c.crawl_sources||[],null,2);
+  // Scheduler
+  const s=c.scheduler||{};
+  document.getElementById('cSchedEnabled').checked=!!s.enabled;
+  document.getElementById('cSchedInterval').value=s.interval_minutes||60;
+  document.getElementById('cSchedMinScore').value=s.auto_generate_min_score!=null?s.auto_generate_min_score:75;
+  document.getElementById('cSchedMaxGen').value=s.auto_generate_max_per_run!=null?s.auto_generate_max_per_run:3;
+  document.getElementById('cSchedAutoGen').checked=!!s.auto_generate;
   applyLlmUI(c.llm_enabled!==false);
+  loadSchedulerStatus();
+}
+
+async function loadSchedulerStatus(){
+  try{
+    const s=await api('/api/scheduler');
+    let txt=s.running?'● running':'○ stopped';
+    const r=s.last_result;
+    if(r){txt+=' · last pass: +'+r.added+' new, '+(r.generated||0)+' drafted'
+      +(r.error?(' · error: '+r.error):'')+(r.finished_at?(' ('+r.finished_at+')'):'');}
+    document.getElementById('schedStatus').textContent=txt;
+  }catch(e){}
 }
 document.getElementById('cLlmEnabled').onchange=(e)=>applyLlmUI(e.target.checked);
 document.getElementById('saveSettings').onclick=async()=>{
-  let sources,mappings;
+  let sources,mappings,crawl;
   try{sources=JSON.parse(cSources.value);}catch(e){return toast('Sources JSON is invalid','err');}
   try{mappings=JSON.parse(cMappings.value);}catch(e){return toast('Site rules JSON is invalid','err');}
+  try{crawl=JSON.parse(cCrawl.value);}catch(e){return toast('Crawler JSON is invalid','err');}
+  const email_ingest={
+    enabled:document.getElementById('cEmailEnabled').checked,
+    protocol:document.getElementById('cEmailProto').value,
+    host:document.getElementById('cEmailHost').value.trim(),
+    port:Number(document.getElementById('cEmailPort').value)||0,
+    ssl:true,
+    username:document.getElementById('cEmailUser').value.trim(),
+    password:document.getElementById('cEmailPass').value,
+    folder:document.getElementById('cEmailFolder').value.trim()||'INBOX',
+    search:document.getElementById('cEmailSearch').value.trim()||'UNSEEN',
+    mark_seen:document.getElementById('cEmailMarkSeen').checked,
+    max_messages:Number(document.getElementById('cEmailMax').value)||50,
+    default_country:document.getElementById('cEmailCountry').value.trim(),
+    sender_allowlist:document.getElementById('cEmailSenders').value.split(',').map(s=>s.trim()).filter(Boolean)};
+  const scheduler={
+    enabled:document.getElementById('cSchedEnabled').checked,
+    interval_minutes:Number(document.getElementById('cSchedInterval').value)||60,
+    auto_generate:document.getElementById('cSchedAutoGen').checked,
+    auto_generate_min_score:Number(document.getElementById('cSchedMinScore').value)||0,
+    auto_generate_max_per_run:Number(document.getElementById('cSchedMaxGen').value)||0};
   const body={ollama_url:cOllamaUrl.value,ollama_model:cOllamaModel.value,
     output_language:cLang.value,rate_limit_seconds:Number(cRate.value),
     request_timeout:Number(cTimeout.value),
     llm_enabled:document.getElementById('cLlmEnabled').checked,
     browser:document.getElementById('cBrowser').value,
     preferred_countries:cCountries.value.split(',').map(s=>s.trim()).filter(Boolean),
-    sources,site_mappings:mappings};
+    sources,site_mappings:mappings,crawl_sources:crawl,email_ingest,scheduler};
   await api('/api/config',{method:'POST',headers:{'content-type':'application/json'},
     body:JSON.stringify(body)});
-  toast('Settings saved','ok');applyLlmUI(body.llm_enabled);refreshOllama();loadJobs();
+  toast('Settings saved','ok');applyLlmUI(body.llm_enabled);refreshOllama();
+  loadSchedulerStatus();loadJobs();
+};
+document.getElementById('schedRunNowBtn').onclick=async()=>{
+  try{const r=await api('/api/scheduler/run_now',{method:'POST'});
+    toast(r.msg||'A collection pass is running','ok');
+    setTimeout(()=>{loadSchedulerStatus();loadJobs();},2000);}
+  catch(e){toast('Could not start a pass','err');}
+};
+document.getElementById('fetchEmailBtn').onclick=async()=>{
+  showOverlay('Fetching job-alert email…','Reading your mailbox read-only and parsing locally.');
+  try{
+    const resp=await fetch('/api/collect_email',{method:'POST'});
+    const r=await resp.json();
+    if(!resp.ok||r.ok===false){toast(r.error||'Fetch failed','err');}
+    else{toast('Email: added '+r.added+', skipped '+r.skipped+' of '+r.total,'ok');loadJobs();}
+  }catch(e){toast('Fetch failed: '+e.message,'err');}
+  finally{hideOverlay();}
 };
 
 async function loadAudit(){
@@ -2382,12 +3762,104 @@ def api_set_config(req):
     cfg.update(req.json())
     save_config(cfg)
     audit("config_updated", "")
+    # Start/stop the background scheduler to match the new setting.
+    try:
+        reconcile_scheduler(cfg)
+    except Exception as e:
+        audit("scheduler_reconcile_error", str(e))
     return {"ok": True}
 
 
 @app.post("/api/collect")
 def api_collect(req):
     return collect_all(load_config())
+
+
+@app.post("/api/collect_email")
+def api_collect_email(req):
+    """Fetch and ingest job-alert mail on demand (in addition to the combined
+    Collect). Reads the mailbox read-only unless mark_seen is set."""
+    cfg = load_config()
+    c = cfg.get("email_ingest") or {}
+    if not c.get("enabled"):
+        return JSONResponse({"ok": False, "error": "Email ingestion is disabled. "
+                             "Enable it in Settings first."}, status_code=409)
+    if not _email_connection_ok(c):
+        return JSONResponse({"ok": False, "error": "Set host, username and "
+                             "password in Settings first."}, status_code=400)
+    try:
+        jobs = collect_email_jobs(cfg)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": "Mailbox error: {}".format(e)},
+                            status_code=502)
+    added, skipped = store_normalized(jobs, cfg, get_profile())
+    return {"ok": True, "added": added, "skipped": skipped, "total": len(jobs)}
+
+
+@app.post("/api/import_email")
+def api_import_email(req):
+    """Ingest a single saved .eml file uploaded from the browser — no mailbox
+    credentials required. Parses entirely locally."""
+    data = req.body()
+    if not data:
+        return JSONResponse({"ok": False, "error": "Empty file."}, status_code=400)
+    cfg = load_config()
+    try:
+        jobs = parse_eml_upload(data, cfg)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": "Could not parse .eml: {}".format(e)},
+                            status_code=400)
+    if not jobs:
+        return JSONResponse({"ok": False, "error": "No job links found in that "
+                             "email."}, status_code=400)
+    added, skipped = store_normalized(jobs, cfg, get_profile())
+    audit("import_email", "added={} skipped={} total={}".format(
+        added, skipped, len(jobs)))
+    return {"ok": True, "added": added, "skipped": skipped, "total": len(jobs)}
+
+
+@app.post("/api/analyze/{job_id}")
+def api_analyze(req):
+    """Run the optional local-LLM analysis (keywords/entities, translation, fit
+    summary) for one job and persist it."""
+    job_id = req.int_path("job_id")
+    cfg = load_config()
+    if not cfg.get("llm_enabled", True):
+        return JSONResponse({"error": "AI tools are disabled. Enable them in "
+                             "Settings to analyze."}, status_code=409)
+    with db() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if not row:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return analyze_job(dict(row), get_profile(), cfg)
+
+
+@app.get("/api/analysis/{job_id}")
+def api_get_analysis(req):
+    return get_analysis(req.int_path("job_id"))
+
+
+@app.get("/api/scheduler")
+def api_scheduler(req):
+    return scheduler_status()
+
+
+@app.post("/api/scheduler/start")
+def api_scheduler_start(req):
+    scheduler.start()
+    return scheduler_status()
+
+
+@app.post("/api/scheduler/stop")
+def api_scheduler_stop(req):
+    scheduler.stop()
+    return scheduler_status()
+
+
+@app.post("/api/scheduler/run_now")
+def api_scheduler_run_now(req):
+    scheduler.run_now()
+    return {"ok": True, "msg": "A collection pass is running in the background."}
 
 
 @app.get("/api/stats")
@@ -2527,6 +3999,28 @@ def api_save_documents(req):
     return {"ok": True}
 
 
+@app.get("/api/documents/{job_id}/odt")
+def api_document_odt(req):
+    """Compile the stored resume or cover letter for a job into a formatted .odt
+    and return it as a download. ?kind=resume|cover_letter (default resume)."""
+    job_id = req.int_path("job_id")
+    kind = "cover_letter" if req.q("kind") == "cover_letter" else "resume"
+    docs = get_documents(job_id)
+    text = docs.get(kind, "")
+    if not (text or "").strip():
+        return JSONResponse(
+            {"error": "No {} to compile yet — generate or write one first.".format(
+                kind.replace("_", " "))}, status_code=404)
+    with db() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    job = dict(row) if row else None
+    profile = get_profile()
+    data = compile_document_odt(kind, text, profile, job)
+    audit("compile_odt", "job_id={} kind={}".format(job_id, kind))
+    return Response(data, media_type=ODT_MIMETYPE, headers={
+        "Content-Disposition": "attachment; filename=" + odt_filename(kind, profile, job)})
+
+
 @app.post("/api/prefill/{job_id}")
 def api_prefill(req):
     job_id = req.int_path("job_id")
@@ -2631,6 +4125,11 @@ def main():
     init_db()
     cfg = load_config()
     audit("startup", "RJH started")
+    # Bring up the background scheduler if it was left enabled.
+    try:
+        reconcile_scheduler(cfg)
+    except Exception as e:
+        audit("scheduler_reconcile_error", str(e))
     host = cfg["host"]
     port = cfg["port"]
     browse_host = "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
