@@ -1,0 +1,181 @@
+name,url,rss_feed,rss_status,category,country,geographic_scope,sectors_tags,notes
+EURES,https://eures.europa.eu,,unknown - probe required,Public employment service (official EU),Pan-European,EU-wide (official),all sectors; cross-border; relocation support; free,European Commission's official job-mobility portal; ~3M vacancies across all EU + Iceland/Liechtenstein/Norway/Switzerland; includes the EU Talent Pool pilot for non-EU candidates
+LinkedIn,https://www.linkedin.com/jobs,,none - public job RSS discontinued (API/scraping only),Professional network,Pan-European,Global,all sectors; networking; executive; passive recruiting,Dominant professional network in Europe; strongest channel for professional/executive roles
+Indeed,https://www.indeed.com,,"none - public RSS discontinued ~2019 (Publisher API, now also winding down)",Aggregator / general,Pan-European,Global,all sectors; aggregator; free + paid,"Largest aggregator; localized country domains (fr.indeed.com, de.indeed.com, es.indeed.com, it.indeed.com, etc.) in ~28 European markets"
+Glassdoor,https://www.glassdoor.com,,none - no public RSS (API deprecated),General + company reviews,Pan-European,Global,all sectors; reviews; salaries,Listings plus company reviews and salary data; owned by Indeed/Recruit; shares postings with Indeed
+StepStone,https://www.stepstone.com,,unknown - probe required,General job board,Pan-European,Pan-European,engineering; tech; finance; DACH,"The Stepstone Group; strongest in Germany (stepstone.de), Austria, Belgium; major continental player"
+Monster,https://www.monster.com,,unknown - probe required,General job board,Pan-European,Global,all sectors; generalist,"Country domains (.de, .fr, .es, .it, .se, .fi, etc.); declining vs LinkedIn/Indeed but still widely used"
+EuroJobs,https://www.eurojobs.com,,unknown - probe required,General job board,Pan-European,Pan-European,multi-country; hospitality; finance; engineering; IT,Listings across many European countries; filterable by country/industry/level
+JobsinNetwork,https://www.jobsinnetwork.com,,unknown - probe required,Niche / expat network,Pan-European,Pan-European,expats; English-speaking; city-based,"Network of city/expat sites (JobsinBerlin, JobsinAmsterdam, JobsinBrussels, etc.)"
+Europe Language Jobs,https://www.europelanguagejobs.com,,unknown - probe required,Niche / multilingual,Pan-European,Pan-European,multilingual; language skills; customer service; relocation,Specialized in roles requiring foreign-language skills
+The Local Jobs,https://jobs.thelocal.com,,unknown - probe required,Niche / expat,Pan-European,Pan-European,English-language; expats,English-language listings across several European countries
+Jooble,https://jooble.org,,unknown - probe required,Aggregator,Pan-European,Global,aggregator; all sectors,Aggregates listings from many sources; per-country versions
+Careerjet,https://www.careerjet.com,,unknown - probe required,Aggregator,Pan-European,Global,aggregator; all sectors,Job search engine spanning most countries
+Adzuna,https://www.adzuna.com,,unknown - probe required,Aggregator,Pan-European,Pan-European,aggregator; salary data,Aggregator with salary insights; per-country sites
+Talent.com,https://www.talent.com,,unknown - probe required,Aggregator,Pan-European,Global,aggregator,Aggregator (formed from Neuvoo)
+Jobrapido,https://www.jobrapido.com,,unknown - probe required,Aggregator,Pan-European,Global,aggregator,Global job search engine with strong European presence
+Welcome to the Jungle,https://www.welcometothejungle.com,,unknown - probe required,General / startups / culture,Pan-European,Pan-European,startups; tech; employer-brand; culture; media,"French origin, now broad European footprint; rich company profiles; absorbed Otta (2024)"
+JobTeaser,https://www.jobteaser.com,,unknown - probe required,Student / graduate,Pan-European,Pan-European,students; graduates; internships; campus,University-partnership platform across Europe
+Graduateland,https://graduateland.com,,unknown - probe required,Student / graduate,Pan-European,Pan-European,students; graduates; internships,Pan-European graduate/early-career platform
+iAgora,https://www.iagora.com,,unknown - probe required,Student / graduate,Pan-European,Pan-European,students; graduates; internships; international,International internships and graduate jobs in Europe
+Wellfound,https://wellfound.com,,unknown - probe required,Startups,Pan-European,Global,startups; tech; equity; remote,Formerly AngelList Talent; startup-focused; growing European base
+EU Remote Jobs,https://euremotejobs.com,,unknown - probe required,Remote,Pan-European,Pan-European,remote; EU legal entities; EU labour protection,Filters for companies with EU legal entities (proper EU contracts/social security)
+Remote OK,https://remoteok.com,https://remoteok.com/remote-dev-jobs.rss,verified pattern but Cloudflare often returns 403; JSON API https://remoteok.com/api is the reliable route,Remote,Pan-European,Global,remote; tech; digital,Large remote-work board
+We Work Remotely,https://weworkremotely.com,https://weworkremotely.com/remote-jobs.rss,verified - all-jobs feed; per-category feeds exist e.g. /categories/remote-programming-jobs.rss,Remote,Pan-European,Global,remote; tech; design; marketing,Large remote community
+Working Nomads,https://www.workingnomads.com,,unknown - probe required,Remote,Pan-European,Global,remote; curated,Curated remote listings
+FlexJobs,https://www.flexjobs.com,,unknown - probe required,Remote (subscription),Pan-European,Global,remote; flexible; vetted; subscription,Vetted/scam-screened listings; candidate subscription
+Relocate.me,https://relocate.me,,unknown - probe required,Tech / relocation,Pan-European,Pan-European,tech; relocation; visa-sponsor,Tech roles that include relocation/visa support
+EU Careers (EPSO),https://eu-careers.europa.eu,,unknown - probe required,EU institutions,Pan-European,EU-wide (official),EU civil service; permanent; contract; traineeships; competitions,European Personnel Selection Office; recruitment for all EU institutions
+European Commission - senior management,https://commission.europa.eu/about/jobs/job-opportunities-european-commission/apply-management-positions-european-commission_en,,unknown - probe required,EU institutions (senior),Pan-European,EU-wide (official),director; head of unit; senior management; AD grades,Senior/management vacancies at the Commission and EU agencies
+EuroBrussels,https://www.eurobrussels.com,,unknown - probe required,Niche (EU affairs),Pan-European,Pan-European,EU affairs; policy; public affairs; NGO; advocacy; Brussels,"Careers in EU institutions, public affairs, NGOs and think-tanks"
+EURAXESS,https://euraxess.ec.europa.eu/jobs,,unknown - probe required,Academic / research (official EU),Pan-European,EU-wide (official),research; postdoc; PhD; fellowships; funding; mobility; free,EU's official researcher-mobility portal; thousands of vacancies across 43 countries; free posting
+Academic Positions,https://academicpositions.com,,unknown - probe required,Academic / research,Pan-European,Pan-European,academic; PhD; postdoc; faculty,Pan-European academic job board
+AcademicTransfer,https://www.academictransfer.com,,unknown - probe required,Academic / research,Netherlands,Single country,academic; PhD; postdoc,Official platform of Dutch universities/research institutes
+EuroScienceJobs,https://www.eurosciencejobs.com,,unknown - probe required,Academic / research (science),Pan-European,Pan-European,research; postdoc; bioinformatics; biotech; physics,Science research/postdoc jobs across Europe
+jobs.ac.uk,https://www.jobs.ac.uk,,unknown - probe required,Academic / research,United Kingdom,EEA/EFTA & intl,academic; research; professional services,UK-based but lists many international/European academic roles (UK is non-EU)
+EuroPharmaJobs,https://www.europharmajobs.com,,unknown - probe required,Life sciences / pharma,Pan-European,Pan-European,pharma; biotech; clinical research; regulatory; medical affairs; senior,Senior/specialist pharma jobs across Europe
+PharmiWeb.Jobs,https://www.pharmiweb.jobs,,unknown - probe required,Life sciences / pharma / medtech,Pan-European,Pan-European,pharma; biotech; medtech; clinical; regulatory; QA; manufacturing; medical affairs,Broad life-sciences board for Europe
+BioSpace,https://www.biospace.com,,unknown - probe required,Life sciences / biotech,Pan-European,Global,biotech; pharma; life-science news + jobs,US-strong but covers Europe; industry news + jobs
+Nature Careers,https://www.nature.com/naturecareers,,unknown - probe required,Academic / life science,Pan-European,Global,research; science; faculty; industry science,Science careers from Nature; academia + industry
+Science Careers (AAAS),https://jobs.sciencecareers.org,,unknown - probe required,Academic / life science,Pan-European,Global,research; life sciences; salary surveys,AAAS science jobs
+FierceBiotech,https://www.fiercebiotech.com,,unknown - probe required,Life sciences news + jobs,Pan-European,Global,biotech; pharma; industry news,Industry news outlet with job listings
+EPM Scientific,https://www.epmscientific.com,,unknown - probe required,Life sciences recruiter,Pan-European,Global,life sciences; pharma; medtech; recruiter; permanent + contract,Specialist life-sciences staffing firm
+ProClinical,https://www.proclinical.com,,unknown - probe required,Life sciences recruiter,Pan-European,Global,pharma; biotech; medical devices; clinical; recruiter,Life-sciences staffing across Europe
+NonStop Consulting,https://www.nonstopconsulting.com,,unknown - probe required,Life sciences recruiter,Pan-European,Pan-European,life sciences; medical devices; pharma; recruiter,Europe-focused life-sciences/medtech recruiter
+SRG (srgtalent),https://www.srgtalent.com,,unknown - probe required,Life sciences recruiter,Pan-European,Pan-European,life sciences; biotech; medtech; pharma; clinical,Science recruitment agency (UK/Ireland + Europe)
+Honeypot,https://www.honeypot.io,,unknown - probe required,Tech / IT,Pan-European,Pan-European,developers; tech; reverse-recruiting; English-speaking,"Developer-focused, companies apply to candidates; DACH-strong"
+Landing.jobs,https://www.landing.jobs,,unknown - probe required,Tech / IT,Pan-European,Pan-European,tech; developers; relocation; remote,Tech jobs across Europe (Portuguese origin)
+OfferZen,https://www.offerzen.com,,unknown - probe required,Tech / IT,Pan-European,Pan-European,developers; tech; curated,Developer hiring marketplace
+EuroTechJobs,https://www.eurotechjobs.com,,unknown - probe required,Tech / IT,Pan-European,Pan-European,software; tech; English-speaking; multinationals,Tech jobs across Europe for international/English speakers
+EuroEngineerJobs,https://www.euroengineerjobs.com,,unknown - probe required,Engineering + management,Pan-European,Pan-European,engineering; manager; executive,Engineering and management roles across Europe
+Experteer,https://www.experteer.com,,unknown - probe required,Executive / C-level,Pan-European,Pan-European,senior management; director; VP; C-suite; EUR60k+; headhunter network; subscription,Executive career service; confidential mode; DACH strength; country sites for FR/ES/DE/IT
+Exec-Appointments (FT),https://www.exec-appointments.com,,unknown - probe required,Executive / C-level,Pan-European,Pan-European,senior executive; cross-sector,Financial Times executive job board
+Chief Jobs,https://www.chiefjobs.com,,unknown - probe required,Executive / C-level,Pan-European,Pan-European,C-suite; board; senior,C-suite-focused job board (UK + Europe)
+CEO Worldwide,https://www.ceo-worldwide.com,,unknown - probe required,Executive / C-level,Pan-European,Global,CEO; CFO; COO; interim; confidential,International C-level + interim management; iCEO network for confidential searches
+Aruba Exec,https://arubaexec.com,,unknown - probe required,Executive search / board,Pan-European,Pan-European,board; C-suite; VP; confidential,Executive board/C-suite search (UK/Europe/US)
+Korn Ferry,https://www.kornferry.com,,unknown - probe required,Executive search firm,Pan-European,Global,executive search; leadership; C-suite; board,Retained search; candidate registration; not a job board
+Egon Zehnder,https://www.egonzehnder.com,,unknown - probe required,Executive search firm,Pan-European,Global,executive search; board; CEO; leadership advisory,Retained search; not a job board
+Heidrick & Struggles,https://www.heidrick.com,,unknown - probe required,Executive search firm,Pan-European,Global,executive search; leadership; C-suite,Retained search; not a job board
+Spencer Stuart,https://www.spencerstuart.com,,unknown - probe required,Executive search firm,Pan-European,Global,executive search; board; CEO,Retained search; not a job board
+Russell Reynolds Associates,https://www.russellreynolds.com,,unknown - probe required,Executive search firm,Pan-European,Global,executive search; leadership; board,Retained search; not a job board
+Odgers Berndtson,https://www.odgers.com,,unknown - probe required,Executive search firm,Pan-European,Global,executive search; senior; interim,Retained search; not a job board
+Malt,https://www.malt.com,,unknown - probe required,Freelance,Pan-European,Pan-European,freelance; consultants; tech; marketing; project,"Leading European freelance marketplace (FR, DE, ES, NL, etc.); absorbed COMATCH"
+Upwork,https://www.upwork.com,,unknown - probe required,Freelance,Pan-European,Global,freelance; remote; projects,Global freelance platform
+Freelancer.com,https://www.freelancer.com,,unknown - probe required,Freelance,Pan-European,Global,freelance; projects,Global freelance marketplace
+Toptal,https://www.toptal.com,,unknown - probe required,Freelance (vetted),Pan-European,Global,freelance; vetted; senior; tech; finance; design,Vetted senior freelancers
+Fiverr,https://www.fiverr.com,,unknown - probe required,Freelance / gig,Pan-European,Global,gig; freelance; creative; digital,Gig-based freelance marketplace
+Kununu,https://www.kununu.com,,unknown - probe required,Company reviews,Pan-European,Pan-European,reviews; salaries; DACH,Germany/Austria/Switzerland employer-review platform (Glassdoor equivalent); listings too
+karriere.at,https://www.karriere.at,,unknown - probe required,General job board,Austria,Single country,generalist; CV database; German,Austria's leading job board
+AMS eJob-Room,https://www.ams.at,,unknown - probe required,Public employment service,Austria,Single country,public; free; all categories; German,Austria's public employment service (Arbeitsmarktservice)
+jobs.at,https://www.jobs.at,,unknown - probe required,General job board,Austria,Single country,generalist,Austrian generalist board
+XING Jobs,https://www.xing.com/jobs,,unknown - probe required,Professional network,Austria,Single country,networking; DACH; German-speaking,German-speaking professional network (DE/AT/CH); paid postings since 2026
+VDAB,https://www.vdab.be,,unknown - probe required,Public employment service,Belgium,Single country,public; Flanders; Dutch,Flemish public employment service
+Le Forem,https://www.leforem.be,,unknown - probe required,Public employment service,Belgium,Single country,public; Wallonia; French,Walloon public employment + training service
+Actiris,https://www.actiris.brussels,,unknown - probe required,Public employment service,Belgium,Single country,public; Brussels; bilingual,Brussels-region public employment service
+Jobat,https://www.jobat.be,,unknown - probe required,General job board,Belgium,Single country,generalist; Dutch/French,Major Belgian generalist board
+References,https://references.lesoir.be,,unknown - probe required,General job board,Belgium,Single country,generalist; French,Belgian board (Le Soir)
+ICTjob,https://www.ictjob.be,,unknown - probe required,Tech / IT,Belgium,Single country,IT; tech,Belgian IT-focused board
+Jobs.bg,https://www.jobs.bg,,unknown - probe required,General job board,Bulgaria,Single country,generalist; Bulgarian,Bulgaria's leading job portal
+Zaplata.bg,https://www.zaplata.bg,,unknown - probe required,General job board,Bulgaria,Single country,generalist; classifieds,Popular Bulgarian jobs/classifieds site
+MojPosao,https://www.moj-posao.net,,unknown - probe required,General job board,Croatia,Single country,generalist; Croatian,Croatia's leading job board
+Posao.hr,https://www.posao.hr,,unknown - probe required,General job board,Croatia,Single country,generalist,Croatian generalist board
+CyprusJobs,https://www.cyprusjobs.com,,unknown - probe required,General job board,Cyprus,Single country,generalist,Cypriot job portal
+Ergodotisi,https://www.ergodotisi.com,,unknown - probe required,General job board,Cyprus,Single country,generalist,Cyprus job site
+Jobs.cz,https://www.jobs.cz,,unknown - probe required,General job board,Czechia,Single country,generalist; Czech,Leading Czech job board
+Prace.cz,https://www.prace.cz,,unknown - probe required,General job board,Czechia,Single country,generalist,Major Czech board (sister to Jobs.cz)
+StartupJobs.cz,https://www.startupjobs.cz,,unknown - probe required,Startups / tech,Czechia,Single country,startups; tech,Czech startup/tech jobs
+Jobindex,https://www.jobindex.dk,,unknown - probe required,General / aggregator,Denmark,Single country,generalist; largest; aggregator,Denmark's largest job portal; also runs Jobsafari in several countries
+Jobnet,https://www.jobnet.dk,,unknown - probe required,Public employment service,Denmark,Single country,public; government,Danish public employment portal
+Work in Denmark,https://www.workindenmark.dk,,unknown - probe required,Public / official (internationals),Denmark,Single country,official; internationals; English; relocation,Official portal for international candidates
+The Hub,https://thehub.io,,unknown - probe required,Startups,Denmark,Single country,startups; tech; Nordic; VC-backed,Nordic startup jobs (also serves wider Nordics)
+CV.ee,https://www.cv.ee,,unknown - probe required,General job board,Estonia,Single country,generalist,Leading Estonian job board (CV Keskus group)
+CVKeskus,https://www.cvkeskus.ee,,unknown - probe required,General job board,Estonia,Single country,generalist,Estonian generalist board
+Töötukassa,https://www.tootukassa.ee,,unknown - probe required,Public employment service,Estonia,Single country,public,Estonian Unemployment Insurance Fund
+Duunitori,https://duunitori.fi,,unknown - probe required,General job board,Finland,Single country,generalist; largest private,Finland's largest private job portal
+Työmarkkinatori (Job Market Finland),https://tyomarkkinatori.fi,,unknown - probe required,Public employment service,Finland,Single country,public; government,Finnish public employment platform (formerly TE-palvelut)
+Oikotie Työpaikat,https://tyopaikat.oikotie.fi,,unknown - probe required,General job board,Finland,Single country,generalist,Finnish generalist board
+Rekrytointi.com,https://www.rekrytointi.com,,unknown - probe required,General job board,Finland,Single country,generalist; CV database,Finnish board/recruitment platform
+France Travail,https://www.francetravail.fr,,unknown - probe required,Public employment service,France,Single country,public; largest; all sectors,France's public employment service (formerly Pôle emploi)
+APEC,https://www.apec.fr,,unknown - probe required,Executive / cadres,France,Single country,cadres; executives; engineers; managers; free,Association for the employment of executives (cadres); key for management/engineering roles
+HelloWork,https://www.hellowork.com,,unknown - probe required,General job board,France,Single country,generalist; regional,Leading French generalist board (formerly RegionsJob); ~14M visits/month
+Cadremploi,https://www.cadremploi.fr,,unknown - probe required,Executive / cadres,France,Single country,cadres; managers; senior,Executive/manager-focused board
+Meteojob,https://www.meteojob.com,,unknown - probe required,General / matching,France,Single country,matching; generalist,Algorithmic-matching board
+APECITA,https://www.apecita.com,,unknown - probe required,Niche (agri/agrifood),France,Single country,agriculture; agrifood; environment,Agriculture/agrifood employment association
+Jobijoba,https://www.jobijoba.com,,unknown - probe required,Aggregator,France,Single country,aggregator,French job aggregator
+Licorne Society,https://www.licornesociety.com,,unknown - probe required,Startups,France,Single country,startups; scale-ups,France-focused startup/scale-up board
+Bundesagentur für Arbeit,https://www.arbeitsagentur.de,,unknown - probe required,Public employment service,Germany,Single country,public; largest; all sectors; German,Germany's federal employment agency
+StepStone Germany,https://www.stepstone.de,,unknown - probe required,General job board,Germany,Single country,professional; engineering; tech; finance,Flagship German StepStone site; ~67M visits/month
+Arbeitnow,https://www.arbeitnow.com,,unknown - probe required,General / tech,Germany,Single country,tech; design; English-speaking; visa-sponsor; remote,Berlin-based; English-speaking & visa-sponsor friendly
+Jobware,https://www.jobware.de,,unknown - probe required,General job board,Germany,Single country,professional; specialist,German professional/specialist board
+meinestadt.de,https://www.meinestadt.de,,unknown - probe required,General / local,Germany,Single country,local; city-based; generalist,City portal with a large jobs section
+EnglishJobs.de,https://englishjobs.de,,unknown - probe required,Niche (English-speaking),Germany,Single country,English-speaking; expats; international,English-language jobs in Germany
+Kariera.gr,https://www.kariera.gr,,unknown - probe required,General job board,Greece,Single country,generalist; Greek,Leading Greek job portal
+Skywalker.gr,https://www.skywalker.gr,,unknown - probe required,General job board,Greece,Single country,generalist,Major Greek generalist board
+DYPA,https://www.dypa.gov.gr,,unknown - probe required,Public employment service,Greece,Single country,public; government,Greek public employment service (formerly OAED)
+Profession.hu,https://www.profession.hu,,unknown - probe required,General job board,Hungary,Single country,generalist; Hungarian,Leading Hungarian job board
+CVOnline.hu,https://www.cvonline.hu,,unknown - probe required,General job board,Hungary,Single country,generalist,Hungarian generalist board (CV Online group)
+IrishJobs.ie,https://www.irishjobs.ie,,unknown - probe required,General job board,Ireland,Single country,generalist; all sectors,Major Irish board
+Jobs.ie,https://www.jobs.ie,,unknown - probe required,General job board,Ireland,Single country,generalist; largest indigenous,Largest indigenous Irish board
+RecruitIreland,https://www.recruitireland.com,,unknown - probe required,General / agencies,Ireland,Single country,recruitment agencies; generalist,Connects to Irish recruitment agencies
+publicjobs.ie,https://www.publicjobs.ie,,unknown - probe required,Public sector,Ireland,Single country,public sector; civil service; government,Ireland's public-sector recruitment
+Medical Jobs Ireland,https://www.medicaljobs.ie,,unknown - probe required,Niche (healthcare),Ireland,Single country,healthcare; medical,Irish healthcare/medical jobs
+Subito Lavoro,https://www.subito.it/lavoro,,unknown - probe required,General / classifieds,Italy,Single country,generalist; classifieds; local,Major Italian board; absorbed InfoJobs Italy listings at end-2025
+Cliclavoro,https://www.cliclavoro.gov.it,,unknown - probe required,Public employment service,Italy,Single country,public; government,Italian public employment portal (Ministry of Labour); see also SIISL
+Almalaurea,https://www.almalaurea.it,,unknown - probe required,Student / graduate,Italy,Single country,graduates; universities; junior,University-consortium graduate jobs
+Jobbydoo,https://www.jobbydoo.it,,unknown - probe required,Aggregator,Italy,Single country,aggregator,Italian job aggregator
+Joinrs,https://www.joinrs.com,,unknown - probe required,Student / graduate,Italy,Single country,students; graduates; internships; AI matching,Student/graduate platform with AI matching
+CV.lv,https://www.cv.lv,,unknown - probe required,General job board,Latvia,Single country,generalist,Leading Latvian board (CV Keskus group)
+NVA,https://www.nva.gov.lv,,unknown - probe required,Public employment service,Latvia,Single country,public; government,Latvian State Employment Agency
+CVbankas,https://www.cvbankas.lt,,unknown - probe required,General job board,Lithuania,Single country,generalist,Leading Lithuanian job board
+CVonline.lt,https://www.cvonline.lt,,unknown - probe required,General job board,Lithuania,Single country,generalist,Lithuanian generalist board
+Užimtumo tarnyba,https://uzt.lt,,unknown - probe required,Public employment service,Lithuania,Single country,public; government,Lithuanian Employment Service
+Jobs.lu,https://www.jobs.lu,,unknown - probe required,General job board,Luxembourg,Single country,generalist; multilingual,Leading Luxembourg board
+Moovijob,https://www.moovijob.com,,unknown - probe required,General job board,Luxembourg,Single country,generalist; cross-border; Greater Region,Luxembourg + Greater Region jobs; runs job fairs
+ADEM,https://adem.public.lu,,unknown - probe required,Public employment service,Luxembourg,Single country,public; government,Luxembourg public employment service
+KeepMePosted,https://www.keepmeposted.com.mt,,unknown - probe required,General job board,Malta,Single country,generalist,Maltese job site
+Jobsplus,https://jobsplus.gov.mt,,unknown - probe required,Public employment service,Malta,Single country,public; government,Maltese public employment service
+Nationale Vacaturebank,https://www.nationalevacaturebank.nl,,unknown - probe required,General job board,Netherlands,Single country,generalist; mid-level; Dutch,Largest purely-Dutch job board
+Werk.nl (UWV),https://www.werk.nl,,unknown - probe required,Public employment service,Netherlands,Single country,public; government; free,Dutch public employment portal (UWV)
+Intermediair,https://www.intermediair.nl,,unknown - probe required,General (highly educated),Netherlands,Single country,academic; management; specialist; university-level,For highly educated professionals (DPG Media network)
+Magnet.me,https://www.magnet.me,,unknown - probe required,Student / graduate,Netherlands,Single country,students; graduates; young professionals,Popular with under-30s; also wider EU
+Jobbird,https://www.jobbird.com,,unknown - probe required,General job board,Netherlands,Single country,generalist,Dutch generalist board
+YoungCapital,https://www.youngcapital.nl,,unknown - probe required,Staffing (young/students),Netherlands,Single country,students; young professionals; temp,Staffing platform for students/young professionals
+Pracuj.pl,https://www.pracuj.pl,,unknown - probe required,General job board,Poland,Single country,generalist; largest; all sectors,Poland's largest job portal
+OLX Praca,https://www.olx.pl/praca,,unknown - probe required,General / classifieds,Poland,Single country,classifieds; entry-level; logistics; retail,Jobs section of OLX classifieds
+Praca.pl,https://www.praca.pl,,unknown - probe required,General job board,Poland,Single country,generalist,Polish generalist board
+GoWork.pl,https://www.gowork.pl,,unknown - probe required,General + reviews,Poland,Single country,generalist; reviews,Polish board with company reviews
+No Fluff Jobs,https://nofluffjobs.com,,unknown - probe required,Tech / IT,Poland,Pan-European,IT; transparent salaries; CEE,IT board with mandatory salary ranges; strong across Poland/CEE and expanding in Europe
+Just Join IT,https://justjoin.it,,unknown - probe required,Tech / IT,Poland,Single country,IT; developers; salary ranges,Major Polish/CEE IT board
+Bulldogjob,https://bulldogjob.com,,unknown - probe required,Tech / IT,Poland,Single country,IT; developers; salary,Polish IT board
+Rocket Jobs,https://rocketjobs.pl,,unknown - probe required,General (marketing/sales),Poland,Single country,marketing; sales; creative,Polish non-tech board (Just Join IT sister brand)
+Net-Empregos,https://www.net-empregos.com,,unknown - probe required,General job board,Portugal,Single country,generalist; largest,Portugal's largest job portal
+Sapo Emprego,https://emprego.sapo.pt,,unknown - probe required,General job board,Portugal,Single country,generalist; multimedia CVs,Jobs under the SAPO portal
+Expresso Emprego,https://expressoemprego.pt,,unknown - probe required,General job board,Portugal,Single country,generalist; newspaper-backed,Expresso newspaper job board
+Alerta Emprego,https://www.alertaemprego.pt,,unknown - probe required,General job board,Portugal,Single country,generalist,Portuguese generalist board
+IEFP,https://www.iefp.pt,,unknown - probe required,Public employment service,Portugal,Single country,public; government,Portuguese public employment & vocational training institute
+eJobs,https://www.ejobs.ro,,unknown - probe required,General job board,Romania,Single country,generalist; largest,Romania's largest job platform
+BestJobs,https://www.bestjobs.eu,,unknown - probe required,General job board,Romania,Single country,generalist,Major Romanian board
+Hipo.ro,https://www.hipo.ro,,unknown - probe required,Student / graduate / professional,Romania,Single country,graduates; professionals,Romanian board for graduates/professionals
+ANOFM,https://www.anofm.ro,,unknown - probe required,Public employment service,Romania,Single country,public; government,Romanian National Employment Agency
+Profesia.sk,https://www.profesia.sk,,unknown - probe required,General job board,Slovakia,Single country,generalist; largest,Slovakia's leading job board
+Kariera.sk,https://www.kariera.sk,,unknown - probe required,General job board,Slovakia,Single country,generalist,Slovak generalist board
+ÚPSVR,https://www.upsvr.gov.sk,,unknown - probe required,Public employment service,Slovakia,Single country,public; government,"Slovak Central Office of Labour, Social Affairs and Family"
+MojeDelo,https://www.mojedelo.com,,unknown - probe required,General job board,Slovenia,Single country,generalist,Leading Slovenian job board
+Optius,https://www.optius.com,,unknown - probe required,General job board,Slovenia,Single country,generalist,Slovenian generalist board
+ZRSZ,https://www.ess.gov.si,,unknown - probe required,Public employment service,Slovenia,Single country,public; government,Employment Service of Slovenia
+InfoJobs,https://www.infojobs.net,,unknown - probe required,General job board,Spain,Single country,generalist; largest; all sectors,Spain's leading job board (note: distinct from now-closed InfoJobs Italy)
+Infoempleo,https://www.infoempleo.com,,unknown - probe required,General job board,Spain,Single country,generalist; career resources; oposiciones,Veteran Spanish board (Vocento group)
+Tecnoempleo,https://www.tecnoempleo.com,,unknown - probe required,Tech / IT,Spain,Single country,IT; developers; tech,Leading Spanish IT board
+Empléate (SEPE),https://www.empleate.gob.es,,unknown - probe required,Public employment service,Spain,Single country,public; government; aggregates regional,SEPE public-employment metasearch (national + 17 regional services)
+Jobandtalent,https://www.jobandtalent.com,,unknown - probe required,General / temp,Spain,Single country,temporary; logistics; warehouse; app-based,App-based temp-work platform
+Turijobs,https://www.turijobs.com,,unknown - probe required,Niche (tourism/hospitality),Spain,Single country,tourism; hospitality,Hospitality/tourism jobs
+Feina Activa,https://feinaactiva.gencat.cat,,unknown - probe required,Public (regional),Spain,Single country,public; Catalonia; regional,Catalan public employment portal
+Platsbanken (Arbetsförmedlingen),https://arbetsformedlingen.se/platsbanken,,unknown - probe required,Public employment service,Sweden,Single country,public; largest; all sectors,Sweden's public employment service / largest job site
+Blocket Jobb,https://jobb.blocket.se,,unknown - probe required,General / classifieds,Sweden,Single country,classifieds; generalist,Jobs section of Blocket
+The Local Sweden,https://www.thelocal.se/jobs,,unknown - probe required,Niche (English),Sweden,Single country,English-language; expats,English-language jobs in Sweden
+Academic Work,https://www.academicwork.se,,unknown - probe required,Staffing (young professionals),Sweden,Single country,young professionals; students; staffing,Nordic staffing for students/young professionals
+Finn.no,https://www.finn.no,,unknown - probe required,General / classifieds,Norway,EEA/EFTA (non-EU),generalist; classifieds,Norway's main classifieds/jobs site
+NAV,https://www.nav.no,,unknown - probe required,Public employment service,Norway,EEA/EFTA (non-EU),public; government,Norwegian public employment service
+Jobs.ch,https://www.jobs.ch,,unknown - probe required,General job board,Switzerland,EEA/EFTA (non-EU),generalist,Leading Swiss job board
+JobScout24 (CH),https://www.jobscout24.ch,,unknown - probe required,General job board,Switzerland,EEA/EFTA (non-EU),generalist,Swiss generalist board
+Alfred.is,https://alfred.is,,unknown - probe required,General job board,Iceland,EEA/EFTA (non-EU),generalist,Icelandic job board

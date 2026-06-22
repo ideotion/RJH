@@ -201,6 +201,11 @@ DATA_DIR = os.path.join(os.getcwd(), "rjh_data")
 DB_PATH = os.path.join(DATA_DIR, "rjh.db")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 TMP_DIR = os.path.join(DATA_DIR, "tmp")
+# The bundled source directory ships NEXT TO this script (not under the data
+# dir), so it travels with the app and stays read-only. Discovery results — the
+# mutable part — are cached separately in the database (catalog_feeds).
+CATALOG_CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "sources_catalog.csv")
 USER_AGENT = ("RJH/0.2 (Reverse Job Hunting; +https://github.com/ideotion/RJH; "
               "ethical open-source job copilot)")
 
@@ -332,6 +337,24 @@ DEFAULT_CONFIG = {
         "auto_generate": False,        # auto-draft docs for top new matches (needs Ollama)
         "auto_generate_min_score": 75,
         "auto_generate_max_per_run": 3
+    },
+    # Source directory + feed discovery. RJH ships a curated directory of European
+    # job sources (sources_catalog.csv). When the background scheduler runs, it can
+    # also PROBE those sources for a usable feed: RSS/Atom via <link rel="alternate">
+    # autodiscovery and a short list of conventional feed paths, plus known JSON/ATS
+    # endpoints (Greenhouse, Lever, Ashby, Recruitee, …). Every probe goes through
+    # the one ethical fetch pathway (SSRF guard, robots fail-closed, per-domain rate
+    # limit) and every candidate is VALIDATED — parsed and required to yield at least
+    # one real posting — before it is recorded. Results are cached, so a source is
+    # only re-probed after "recheck_days". The sweep is a slow ROLLING one: at most
+    # "max_sites_per_pass" sources per scheduler pass, keeping it polite and bounded.
+    # Finding a feed only fills the directory; promoting it to a live source stays
+    # your explicit choice (Sources tab -> "Add as source").
+    "discovery": {
+        "enabled": True,
+        "max_sites_per_pass": 15,
+        "recheck_days": 14,
+        "probe_paths": True
     },
     # Per-site pre-fill rules. The first rule whose lowercased "match" is a
     # substring of the job URL (or its host) wins. "fields" maps a category to an
@@ -472,6 +495,22 @@ def init_db():
                 skipped INTEGER,
                 generated INTEGER,
                 error TEXT
+            );
+            -- Cached results of probing each catalogued source for a feed/API
+            -- (the Sources directory). Keyed by the source's canonical site URL.
+            -- "meta" carries the JSON root/field-map for json_api hits so a found
+            -- endpoint can be promoted to a real source without re-deriving it.
+            CREATE TABLE IF NOT EXISTS catalog_feeds (
+                url TEXT PRIMARY KEY,
+                name TEXT,
+                feed_url TEXT,
+                feed_type TEXT,
+                method TEXT,
+                status TEXT,
+                detail TEXT,
+                item_count INTEGER DEFAULT 0,
+                meta TEXT,
+                checked_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
             CREATE INDEX IF NOT EXISTS idx_jobs_score ON jobs(score);
@@ -1516,6 +1555,416 @@ def collect_from_crawl(src, cfg):
 
 
 # --------------------------------------------------------------------------- #
+# Source directory + feed discovery
+#
+# RJH ships a curated directory of European job sources (sources_catalog.csv).
+# Discovery probes a source for a usable feed and caches the result so the app
+# can turn it into a normal "rss"/"json_api" source. Three methods, cheapest
+# first: (1) <link rel="alternate"> autodiscovery in the homepage <head>;
+# (2) known JSON/ATS endpoints (Greenhouse, Lever, Ashby, Recruitee,
+# SmartRecruiters); (3) a short list of conventional feed paths. Every fetch
+# goes through ethical_get (SSRF guard, robots fail-closed, per-domain rate
+# limit) and every candidate is VALIDATED — parsed and required to yield at
+# least one real posting — before it counts. Results live in catalog_feeds and
+# refresh on a slow, bounded, rolling schedule.
+# --------------------------------------------------------------------------- #
+
+_catalog_cache = None
+
+
+def load_source_catalog():
+    """Read the bundled source directory (CSV) into a list of dicts. Cached for
+    the process. Returns [] if the file is missing, so the app still runs."""
+    global _catalog_cache
+    if _catalog_cache is not None:
+        return _catalog_cache
+    rows = []
+    try:
+        with open(CATALOG_CSV_PATH, newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                name = (r.get("name") or "").strip()
+                url = (r.get("url") or "").strip()
+                if not name or not url:
+                    continue
+                rows.append({
+                    "name": name,
+                    "url": url,
+                    "rss_feed": (r.get("rss_feed") or "").strip(),
+                    "rss_status": (r.get("rss_status") or "").strip(),
+                    "category": (r.get("category") or "").strip(),
+                    "country": (r.get("country") or "").strip(),
+                    "geographic_scope": (r.get("geographic_scope") or "").strip(),
+                    "sectors_tags": (r.get("sectors_tags") or "").strip(),
+                    "notes": (r.get("notes") or "").strip(),
+                })
+    except FileNotFoundError:
+        rows = []
+    except Exception as e:
+        audit("catalog_error", str(e))
+        rows = []
+    _catalog_cache = rows
+    return rows
+
+
+def _site_root(url):
+    """Scheme://host root for a catalogue URL, dropping any path. Probing and
+    <link> autodiscovery both start from the homepage."""
+    p = urlparse(url if "//" in url else "https://" + url)
+    return "{}://{}".format(p.scheme or "https", p.netloc or p.path)
+
+
+class _FeedLinkParser(HTMLParser):
+    """Pulls feed-autodiscovery hints from a page <head>
+    (<link rel="alternate" type="application/rss+xml|atom+xml" href="…">) and
+    collects every href/src so an embedded ATS board can be spotted too."""
+    _FEED_TYPES = ("application/rss+xml", "application/atom+xml")
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.feeds = []        # candidate feed hrefs
+        self.hrefs = []        # all href/src seen (for ATS host detection)
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "link" and (a.get("type") or "").lower() in self._FEED_TYPES:
+            if a.get("href"):
+                self.feeds.append(a["href"])
+        v = a.get("href") or a.get("src")
+        if v and tag in ("a", "link", "script", "iframe"):
+            self.hrefs.append(v)
+
+
+# Known ATS / open-API providers we can turn into a JSON source automatically.
+# Each entry: a regex that captures the org slug from a candidate URL, and a
+# builder that returns the public JSON endpoint + field mapping for
+# parse_json_api. Only providers with a stable, public, GET-able JSON board are
+# listed; anything needing POST/keys/per-tenant config is left for a manual
+# adapter, so we never record a feed we cannot actually read.
+_ATS_STOP = {"www", "api", "jobs", "careers", "embed", "help", "support",
+             "blog", "about", "static", "assets", "cdn"}
+_ATS_PROVIDERS = [
+    ("greenhouse",
+     re.compile(r"(?:boards|job-boards)\.greenhouse\.io/(?:embed/job_board\?for=)?"
+                r"([A-Za-z0-9_.-]+)", re.I),
+     lambda org: {
+         "url": "https://boards-api.greenhouse.io/v1/boards/%s/jobs?content=true" % org,
+         "type": "json_api", "root": "jobs",
+         "map": {"title": "title", "url": "absolute_url", "location": "location.name",
+                 "description": "content", "posted_at": "updated_at"}}),
+    ("lever",
+     re.compile(r"jobs\.lever\.co/([A-Za-z0-9_.-]+)", re.I),
+     lambda org: {
+         "url": "https://api.lever.co/v0/postings/%s?mode=json" % org,
+         "type": "json_api",
+         "map": {"title": "text", "url": "hostedUrl", "location": "categories.location",
+                 "description": "descriptionPlain", "posted_at": "createdAt"}}),
+    ("ashby",
+     re.compile(r"jobs\.ashbyhq\.com/([A-Za-z0-9_.-]+)", re.I),
+     lambda org: {
+         "url": "https://api.ashbyhq.com/posting-api/job-board/%s" % org,
+         "type": "json_api", "root": "jobs",
+         "map": {"title": "title", "url": "jobUrl", "location": "location",
+                 "description": "descriptionPlain", "posted_at": "publishedAt"}}),
+    ("recruitee",
+     re.compile(r"([A-Za-z0-9_-]+)\.recruitee\.com", re.I),
+     lambda org: {
+         "url": "https://%s.recruitee.com/api/offers/" % org,
+         "type": "json_api", "root": "offers",
+         "map": {"title": "title", "url": "careers_url", "location": "location",
+                 "description": "description", "posted_at": "published_at"}}),
+    ("smartrecruiters",
+     re.compile(r"(?:careers|jobs)\.smartrecruiters\.com/([A-Za-z0-9_-]+)", re.I),
+     lambda org: {
+         "url": "https://api.smartrecruiters.com/v1/companies/%s/postings" % org,
+         "type": "json_api", "root": "content",
+         "map": {"title": "name", "url": "ref", "location": "location.city",
+                 "posted_at": "releasedDate"}}),
+]
+
+
+def _ats_endpoint(url):
+    """If `url` points at (or embeds) a known ATS board, return a source-like
+    dict {name,url,type,root?,map} for its public JSON API, else None."""
+    if not url:
+        return None
+    for name, rx, build in _ATS_PROVIDERS:
+        m = rx.search(url)
+        if m and m.group(1).lower() not in _ATS_STOP:
+            ep = build(m.group(1))
+            ep["name"] = name
+            return ep
+    return None
+
+
+def _detect_ats(urls):
+    for u in urls or []:
+        ep = _ats_endpoint(u)
+        if ep:
+            return ep
+    return None
+
+
+# A short, high-yield set of conventional feed locations, tried against the site
+# root only when no <link> hint and no ATS board were found.
+_FEED_PATHS = ("/feed", "/rss", "/feed.xml", "/rss.xml", "/atom.xml",
+               "/jobs.rss", "/jobs/feed", "/careers/feed", "/?feed=rss2",
+               "/index.xml")
+
+
+def _validate_rss(feed_url, cfg):
+    """Fetch a candidate RSS/Atom URL and confirm it parses to >=1 posting with a
+    link. ET rejects HTML, so a soft-404 page can't pass. (ok, count, detail)."""
+    try:
+        resp = ethical_get(feed_url, cfg, strict=True, conditional=False)
+    except Exception as e:
+        return False, 0, "error: {}".format(e)
+    if resp is None:
+        return False, 0, "blocked by robots/guard"
+    if resp.status_code != 200:
+        return False, 0, "http {}".format(resp.status_code)
+    good = [e for e in parse_feed(resp.text) if e.get("url")]
+    return (bool(good), len(good), "" if good else "no postings in feed")
+
+
+def _validate_json(endpoint, cfg):
+    """endpoint is a source-like dict {url,type,root?,map}. Confirms the JSON API
+    returns >=1 posting via parse_json_api. (ok, count, detail)."""
+    try:
+        resp = ethical_get(endpoint["url"], cfg, strict=True, conditional=False)
+    except Exception as e:
+        return False, 0, "error: {}".format(e)
+    if resp is None:
+        return False, 0, "blocked by robots/guard"
+    if resp.status_code != 200:
+        return False, 0, "http {}".format(resp.status_code)
+    try:
+        src = dict(endpoint)
+        src["name"] = "probe"
+        jobs = parse_json_api(resp.text, src)
+    except Exception:
+        return False, 0, "could not parse JSON API"
+    return (bool(jobs), len(jobs), "" if jobs else "no postings in API")
+
+
+def _seed_status(entry):
+    """Map the directory's free-text rss_status into a decisive (status, detail),
+    or None meaning "unknown — go probe it"."""
+    s = (entry.get("rss_status") or "").lower()
+    if not s or "unknown" in s or "probe" in s:
+        return None
+    if "discontinued" in s or "no public rss" in s or "none" in s:
+        return ("discontinued", entry.get("rss_status", ""))
+    if "verified" in s:
+        return ("verified", entry.get("rss_status", ""))
+    return None
+
+
+def _save_catalog_feed(rec):
+    with _db_lock, db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO catalog_feeds "
+            "(url,name,feed_url,feed_type,method,status,detail,item_count,meta,checked_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (rec["url"], rec["name"], rec["feed_url"], rec["feed_type"],
+             rec["method"], rec["status"], rec["detail"], rec["item_count"],
+             rec.get("meta", ""), rec["checked_at"]))
+    audit("discover", "{}: {} ({})".format(
+        rec["name"], rec["status"], rec["feed_url"] or rec["method"]))
+
+
+def discover_feed_for_source(entry, cfg):
+    """Probe ONE directory entry for a usable feed/API and cache the result.
+    `entry` is a row from load_source_catalog(). Returns the result dict."""
+    name = entry.get("name", "")
+    site = entry.get("url", "")
+    key = canonicalize_url(site)
+    now = dt.datetime.now().isoformat(timespec="seconds")
+
+    def record(feed_url, feed_type, method, status, detail, count, meta=""):
+        rec = {"url": key, "name": name, "feed_url": feed_url,
+               "feed_type": feed_type, "method": method, "status": status,
+               "detail": detail, "item_count": count, "meta": meta,
+               "checked_at": now}
+        _save_catalog_feed(rec)
+        return rec
+
+    def json_meta(ep):
+        return json.dumps({k: ep[k] for k in ("root", "map") if k in ep})
+
+    # 0) Honour what the directory already knows. A few giants have NO public
+    #    feed — record that (and steer the user to email alerts) without probing.
+    seed = _seed_status(entry)
+    if seed:
+        status, detail = seed
+        feed = entry.get("rss_feed", "")
+        if feed and status != "discontinued":
+            ok, n, _ = _validate_rss(feed, cfg)
+            if ok:
+                return record(feed, "rss", "seed", "verified", "from directory", n)
+        if status == "discontinued":
+            return record("", "", "seed", "discontinued", detail, 0)
+
+    # 1) ATS / known JSON endpoint straight from the listed URL.
+    ep = _detect_ats([site])
+    if ep:
+        ok, n, _ = _validate_json(ep, cfg)
+        if ok:
+            return record(ep["url"], "json_api", "ats:" + ep["name"],
+                          "verified", "", n, json_meta(ep))
+
+    # 2) Fetch the homepage once: <link> autodiscovery + embedded-ATS detection.
+    root = _site_root(site)
+    feeds_from_head, hrefs = [], []
+    try:
+        resp = ethical_get(root, cfg, strict=True, conditional=False)
+    except Exception as e:
+        return record("", "", "homepage", "error", str(e), 0)
+    if resp is None:
+        return record("", "", "homepage", "blocked", "robots/guard refused homepage", 0)
+    if resp.status_code in (401, 403, 429):
+        return record("", "", "homepage", "blocked", "http {}".format(resp.status_code), 0)
+    if resp.status_code == 200 and resp.text:
+        p = _FeedLinkParser()
+        try:
+            p.feed(resp.text)
+        except Exception:
+            pass
+        feeds_from_head = list(dict.fromkeys(
+            sanitize_link(h, root) for h in p.feeds))
+        hrefs = p.hrefs
+
+    # 2a) Validate any <link rel="alternate"> feeds.
+    for f in feeds_from_head:
+        if not f:
+            continue
+        ok, n, _ = _validate_rss(f, cfg)
+        if ok:
+            return record(f, "rss", "link-tag", "verified", "", n)
+
+    # 2b) An ATS board linked from the homepage.
+    ep = _detect_ats(hrefs)
+    if ep:
+        ok, n, _ = _validate_json(ep, cfg)
+        if ok:
+            return record(ep["url"], "json_api", "ats:" + ep["name"],
+                          "verified", "", n, json_meta(ep))
+
+    # 3) Conventional feed paths (opt-out via discovery.probe_paths).
+    if (cfg.get("discovery") or {}).get("probe_paths", True):
+        seen = set(feeds_from_head)
+        for path in _FEED_PATHS:
+            cand = urljoin(root + "/", path.lstrip("/"))
+            if cand in seen:
+                continue
+            seen.add(cand)
+            ok, n, _ = _validate_rss(cand, cfg)
+            if ok:
+                return record(cand, "rss", "path-probe", "verified", "", n)
+
+    return record("", "", "probe", "none", "no feed found", 0)
+
+
+def _due_for_recheck(cached, recheck_days):
+    """A source is due if never checked or last checked longer ago than the
+    window. 'discontinued' is effectively permanent, so re-check it far less."""
+    if not cached or not cached.get("checked_at"):
+        return True
+    try:
+        last = dt.datetime.fromisoformat(cached["checked_at"])
+    except Exception:
+        return True
+    days = recheck_days * (4 if cached.get("status") == "discontinued" else 1)
+    return (dt.datetime.now() - last) >= dt.timedelta(days=days)
+
+
+def discover_sweep(cfg, limit=None, force=False):
+    """Probe up to `limit` directory sources that are due for a (re)check — a
+    slow ROLLING sweep, so repeated passes gradually cover and refresh the whole
+    directory while staying polite. Returns a summary dict."""
+    disc = cfg.get("discovery") or {}
+    cap = limit if limit is not None else int(disc.get("max_sites_per_pass", 15))
+    recheck_days = int(disc.get("recheck_days", 14))
+    catalog = load_source_catalog()
+    with db() as conn:
+        cached = {r["url"]: dict(r) for r in conn.execute(
+            "SELECT url,status,checked_at FROM catalog_feeds").fetchall()}
+    summary = {"checked": 0}
+    for e in catalog:
+        if summary["checked"] >= cap:
+            break
+        key = canonicalize_url(e["url"])
+        if not force and not _due_for_recheck(cached.get(key), recheck_days):
+            continue
+        try:
+            res = discover_feed_for_source(e, cfg)
+            st = res.get("status", "error")
+        except Exception as ex:
+            st = "error"
+            audit("discover_error", "{}: {}".format(e.get("name"), ex))
+        summary["checked"] += 1
+        summary[st] = summary.get(st, 0) + 1
+    audit("discover_sweep", "checked={} verified={} none={} blocked={}".format(
+        summary["checked"], summary.get("verified", 0),
+        summary.get("none", 0), summary.get("blocked", 0)))
+    return summary
+
+
+def catalog_with_status():
+    """Merge the static directory with cached discovery results for display."""
+    catalog = load_source_catalog()
+    with db() as conn:
+        cached = {r["url"]: dict(r) for r in conn.execute(
+            "SELECT * FROM catalog_feeds").fetchall()}
+    out = []
+    for e in catalog:
+        key = canonicalize_url(e["url"])
+        c = cached.get(key, {})
+        row = dict(e)
+        row["key"] = key
+        row["feed_url"] = c.get("feed_url") or e.get("rss_feed", "")
+        row["feed_type"] = c.get("feed_type", "")
+        row["method"] = c.get("method", "")
+        row["detail"] = c.get("detail", "")
+        row["item_count"] = c.get("item_count", 0)
+        row["checked_at"] = c.get("checked_at", "")
+        row["status"] = c.get("status") or ("seeded" if e.get("rss_feed")
+                                             else "untested")
+        out.append(row)
+    return out
+
+
+def add_catalog_source(key, cfg):
+    """Promote a discovered feed for directory entry `key` into cfg['sources'] as
+    a normal rss/json_api source (enabled). Returns (ok, message)."""
+    with db() as conn:
+        row = conn.execute("SELECT * FROM catalog_feeds WHERE url=?",
+                            (key,)).fetchone()
+    if not row or not row["feed_url"] or row["status"] != "verified":
+        return False, "No verified feed for that source yet — run discovery first."
+    feed_url = row["feed_url"]
+    name = row["name"] or feed_url
+    sources = cfg.setdefault("sources", [])
+    for s in sources:
+        if s.get("url") == feed_url:
+            return False, "That feed is already in your sources."
+    entry = {"name": name + " (discovered)", "type": row["feed_type"] or "rss",
+             "enabled": True, "url": feed_url, "default_country": ""}
+    if entry["type"] == "json_api" and row["meta"]:
+        try:
+            meta = json.loads(row["meta"])
+            if meta.get("root"):
+                entry["root"] = meta["root"]
+            if meta.get("map"):
+                entry["map"] = meta["map"]
+        except Exception:
+            pass
+    sources.append(entry)
+    save_config(cfg)
+    audit("catalog_add_source", "{} -> {}".format(name, feed_url))
+    return True, "Added “{}” to your sources.".format(name)
+
+
+# --------------------------------------------------------------------------- #
 # Matching / scoring (0-100)
 # --------------------------------------------------------------------------- #
 
@@ -2340,6 +2789,12 @@ class BackgroundScheduler:
         try:
             res = collect_all(cfg)
             added, skipped = res.get("added", 0), res.get("skipped", 0)
+            # Rolling, bounded feed discovery across the source directory.
+            if (cfg.get("discovery") or {}).get("enabled"):
+                try:
+                    discover_sweep(cfg)
+                except Exception as e:
+                    audit("discover_error", str(e))
             sc = cfg.get("scheduler") or {}
             if sc.get("auto_generate") and cfg.get("llm_enabled", True):
                 generated = self._auto_generate(cfg, sc)
@@ -2756,6 +3211,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   th{color:var(--mut);font-weight:600;font-size:12px}
   .badge{font-weight:700;padding:3px 9px;border-radius:8px;font-size:12px;color:#fff}
   .badge.g{background:var(--good)}.badge.a{background:var(--warn)}.badge.r{background:var(--bad)}
+  .badge.m{background:var(--mut)}.badge.b{background:#1f6feb}
   .pill{font-size:11px;padding:3px 9px;border-radius:12px;border:1px solid var(--line);
     color:var(--mut);text-transform:capitalize}
   .pill.new{color:#9ecbff;border-color:#1f6feb}
@@ -2818,6 +3274,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <button data-tab="jobs" class="active">Jobs</button>
     <button data-tab="docs" id="tabDocsBtn">Documents</button>
     <button data-tab="profile">Profile</button>
+    <button data-tab="sources">Sources</button>
     <button data-tab="settings">Settings</button>
     <button data-tab="audit">Audit</button>
   </nav>
@@ -2937,6 +3394,48 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div class="hint" id="importHint">PDF/ODT import is parsed entirely on your machine. Imported
       text lands here for you to review — click <b>Save profile</b> to keep it.</div>
     <div class="row" style="margin-top:8px"><button class="btn" id="saveProfile">Save profile</button></div>
+  </div>
+</section>
+
+<section id="tab-sources" class="hide">
+  <div class="card">
+    <div class="group-title">Source directory</div>
+    <p class="muted" style="margin:0 0 8px">A curated directory of European job sources. RJH can
+      <b>search each one for a usable feed</b> — RSS/Atom autodiscovery, known JSON/ATS endpoints
+      (Greenhouse, Lever, Ashby, …) and common feed paths — then let you promote a verified feed to a
+      live source. Every probe honours robots.txt (fail-closed) and the per-domain rate limit.</p>
+    <div class="banner" style="margin:0 0 10px">🔎 Discovery runs automatically as part of the
+      <b>background scheduler</b> (Settings → Automation): a slow, bounded rolling sweep, cached so each
+      source is re-probed only every couple of weeks. You can also probe on demand below. Several big
+      boards (LinkedIn, Indeed, Glassdoor) have <b>no public feed</b> — use job-alert email for those.</div>
+    <div class="row">
+      <input id="catSearch" placeholder="Search name, sector, notes…" style="flex:1;min-width:180px"/>
+      <select id="catCountry" style="min-width:140px"><option value="">All countries</option></select>
+      <select id="catCategory" style="min-width:150px"><option value="">All categories</option></select>
+      <select id="catStatus" style="min-width:140px">
+        <option value="">Any status</option>
+        <option value="verified">✓ Verified feed</option>
+        <option value="none">No feed found</option>
+        <option value="discontinued">Discontinued</option>
+        <option value="blocked">Blocked</option>
+        <option value="untested">Untested</option>
+      </select>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn" id="catSweepBtn">Run a discovery sweep</button>
+      <button class="btn sec" id="catRefreshBtn">Refresh</button>
+      <span class="muted" id="catSummary">—</span>
+    </div>
+    <div class="hint">A sweep probes a bounded batch of <b>due</b> sources (default 15 per pass) to stay
+      polite; run it again to cover more of the directory. “Find feed” on a row probes just that one.</div>
+  </div>
+  <div class="card" style="overflow-x:auto">
+    <table>
+      <thead><tr>
+        <th>Source</th><th>Category</th><th>Where</th><th>Status</th><th>Feed</th><th></th>
+      </tr></thead>
+      <tbody id="catBody"><tr><td colspan="6" class="muted">Loading…</td></tr></tbody>
+    </table>
   </div>
 </section>
 
@@ -3111,7 +3610,115 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   document.getElementById('tab-'+b.dataset.tab).classList.remove('hide');
   if(b.dataset.tab==='audit')loadAudit();
   if(b.dataset.tab==='settings')loadSetup();
+  if(b.dataset.tab==='sources')loadCatalog();
 });
+
+// --- Source directory + feed discovery ---
+let catalog=[];
+let _catWired=false;
+async function loadCatalog(){
+  if(!_catWired){
+    _catWired=true;
+    ['catSearch','catCountry','catCategory','catStatus'].forEach(id=>{
+      const el=document.getElementById(id);
+      el.addEventListener(id==='catSearch'?'input':'change',renderCatalog);
+    });
+    document.getElementById('catRefreshBtn').onclick=()=>loadCatalog();
+    document.getElementById('catSweepBtn').onclick=runSweep;
+    document.getElementById('catBody').addEventListener('click',onCatAction);
+  }
+  try{catalog=await api('/api/catalog');}catch(e){catalog=[];}
+  fillCatFilter('catCountry',catalog.map(r=>r.country));
+  fillCatFilter('catCategory',catalog.map(r=>r.category));
+  renderCatalog();
+}
+function fillCatFilter(id,values){
+  const sel=document.getElementById(id);
+  if(sel.options.length>1)return;
+  [...new Set(values.filter(Boolean))].sort((a,b)=>a.localeCompare(b))
+    .forEach(v=>{const o=document.createElement('option');o.value=v;o.textContent=v;sel.appendChild(o);});
+}
+const CAT_BADGE={verified:['g','✓ feed'],seeded:['b','listed'],none:['m','no feed'],
+  discontinued:['a','discontinued'],blocked:['r','blocked'],error:['r','error'],
+  untested:['','untested']};
+function catBadge(s){
+  const b=CAT_BADGE[s]||CAT_BADGE.untested;
+  return b[0]?('<span class="badge '+b[0]+'">'+b[1]+'</span>')
+             :('<span class="muted">'+b[1]+'</span>');
+}
+function catMatch(r,f){
+  if(f.country&&r.country!==f.country)return false;
+  if(f.category&&r.category!==f.category)return false;
+  if(f.status){
+    if(f.status==='verified'&&!(r.status==='verified'||r.status==='seeded'))return false;
+    if(f.status==='untested'&&!(r.status==='untested'||!r.status))return false;
+    if(['none','discontinued','blocked'].includes(f.status)&&r.status!==f.status)return false;
+  }
+  if(f.q){const hay=(r.name+' '+r.category+' '+r.sectors_tags+' '+r.notes+' '+r.country).toLowerCase();
+    if(!hay.includes(f.q))return false;}
+  return true;
+}
+function renderCatalog(){
+  const f={q:document.getElementById('catSearch').value.trim().toLowerCase(),
+    country:document.getElementById('catCountry').value,
+    category:document.getElementById('catCategory').value,
+    status:document.getElementById('catStatus').value};
+  const rows=catalog.filter(r=>catMatch(r,f));
+  const verified=catalog.filter(r=>r.status==='verified'||r.status==='seeded').length;
+  document.getElementById('catSummary').textContent=
+    rows.length+' of '+catalog.length+' shown · '+verified+' with a feed';
+  const body=document.getElementById('catBody');
+  if(!rows.length){body.innerHTML='<tr><td colspan="6" class="muted">No sources match.</td></tr>';return;}
+  body.innerHTML=rows.map(r=>{
+    const feed=r.feed_url?('<a href="'+esc(r.feed_url)+'" target="_blank" rel="noopener">feed</a>'
+      +(r.item_count?(' <span class="muted">('+r.item_count+')</span>'):'')):'<span class="muted">—</span>';
+    const canAdd=(r.status==='verified'||r.status==='seeded')&&r.feed_url;
+    const add=canAdd?('<button class="btn sec" data-act="add" data-key="'+esc(r.key)+'">Add as source</button>'):'';
+    return '<tr>'
+      +'<td><b>'+esc(r.name)+'</b><br><a class="muted" href="'+esc(r.url)+'" target="_blank" rel="noopener" style="font-size:11px">'+esc(r.url)+'</a></td>'
+      +'<td>'+esc(r.category||'')+'</td>'
+      +'<td>'+esc(r.country||'')+'</td>'
+      +'<td>'+catBadge(r.status)+(r.detail?('<br><span class="muted" style="font-size:10px">'+esc(r.detail)+'</span>'):'')+'</td>'
+      +'<td>'+feed+'</td>'
+      +'<td class="row" style="gap:6px"><button class="btn sec" data-act="discover" data-url="'+esc(r.url)+'">Find feed</button>'+add+'</td>'
+      +'</tr>';
+  }).join('');
+}
+async function onCatAction(ev){
+  const btn=ev.target.closest('button[data-act]');if(!btn)return;
+  const act=btn.dataset.act;
+  if(act==='discover'){
+    btn.disabled=true;const old=btn.textContent;btn.textContent='Probing…';
+    try{
+      const r=await api('/api/catalog/discover',{method:'POST',
+        headers:{'content-type':'application/json'},body:JSON.stringify({url:btn.dataset.url})});
+      const res=r.result||{};
+      const row=catalog.find(x=>x.key===res.url);
+      if(row){['feed_url','feed_type','method','status','detail','item_count','checked_at']
+        .forEach(k=>row[k]=res[k]);}
+      toast(res.status==='verified'?('Feed found for '+(res.name||'this source'))
+        :('No feed: '+(res.detail||res.status||'none')),res.status==='verified'?'ok':'');
+      renderCatalog();
+    }catch(e){toast('Discovery failed','err');btn.disabled=false;btn.textContent=old;}
+  }else if(act==='add'){
+    btn.disabled=true;
+    try{
+      const r=await api('/api/catalog/add_source',{method:'POST',
+        headers:{'content-type':'application/json'},body:JSON.stringify({url:btn.dataset.key})});
+      toast(r.msg||(r.ok?'Added':'Could not add'),r.ok?'ok':'err');
+    }catch(e){toast('Could not add source','err');}
+    btn.disabled=false;
+  }
+}
+async function runSweep(){
+  const btn=document.getElementById('catSweepBtn');btn.disabled=true;
+  try{
+    const r=await api('/api/catalog/discover',{method:'POST',
+      headers:{'content-type':'application/json'},body:JSON.stringify({})});
+    toast(r.msg||'Discovery running','ok');
+    setTimeout(()=>{loadCatalog();btn.disabled=false;},6000);
+  }catch(e){toast('Could not start discovery','err');btn.disabled=false;}
+}
 
 async function refreshOllama(){
   if(!llmEnabled)return;
@@ -3860,6 +4467,47 @@ def api_scheduler_stop(req):
 def api_scheduler_run_now(req):
     scheduler.run_now()
     return {"ok": True, "msg": "A collection pass is running in the background."}
+
+
+@app.get("/api/catalog")
+def api_catalog(req):
+    """The bundled source directory merged with cached discovery results."""
+    return catalog_with_status()
+
+
+@app.post("/api/catalog/discover")
+def api_catalog_discover(req):
+    """With {"url": …} probe that one source synchronously and return its result.
+    Otherwise kick a bounded rolling sweep in the background."""
+    cfg = load_config()
+    data = req.json() if req.body() else {}
+    url = (data.get("url") or "").strip()
+    if url:
+        catalog = {canonicalize_url(e["url"]): e for e in load_source_catalog()}
+        entry = catalog.get(canonicalize_url(url))
+        if not entry:
+            return JSONResponse({"ok": False, "error": "Unknown source."},
+                                status_code=404)
+        return {"ok": True, "result": discover_feed_for_source(entry, cfg)}
+    limit = data.get("limit")
+    force = bool(data.get("force"))
+
+    def _run():
+        try:
+            discover_sweep(cfg, limit=limit, force=force)
+        except Exception as e:
+            audit("discover_error", str(e))
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "msg": "Feed discovery is running in the background."}
+
+
+@app.post("/api/catalog/add_source")
+def api_catalog_add_source(req):
+    """Promote a verified discovered feed into the live sources list."""
+    cfg = load_config()
+    key = canonicalize_url((req.json().get("url") or "").strip())
+    ok, msg = add_catalog_source(key, cfg)
+    return {"ok": ok, "msg": msg}
 
 
 @app.get("/api/stats")

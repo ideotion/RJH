@@ -18,7 +18,7 @@ The principles RJH is built on live in [MANIFESTO.md](MANIFESTO.md).
 
 ## What it does
 
-1. Collects job postings four ways: config-driven source adapters (RSS/Atom feeds and JSON job APIs); **job-alert email** (IMAP/POP3, or a dragged-in `.eml`) — the boards that forbid scraping will happily email you matching roles, and reading those breaks no Terms of Service; a **careers-page crawler** that discovers individual postings on a site or ATS; or a CSV/JSON import. Every fetch runs through one ethical pathway: an SSRF guard, robots.txt (fail-closed for auto-discovered URLs), per-domain rate limiting that honours `Crawl-delay`, and conditional GET so unchanged sources are skipped.
+1. Collects job postings several ways: config-driven source adapters (RSS/Atom feeds and JSON job APIs); a built-in **directory of ~180 European job sources** that RJH can probe to discover a usable feed — RSS/Atom autodiscovery, known JSON/ATS endpoints (Greenhouse, Lever, Ashby, …) and common feed paths — and that you then promote into a live source; **job-alert email** (IMAP/POP3, or a dragged-in `.eml`) — the boards that forbid scraping will happily email you matching roles, and reading those breaks no Terms of Service; a **careers-page crawler** that discovers individual postings on a site or ATS; or a CSV/JSON import. Every fetch runs through one ethical pathway: an SSRF guard, robots.txt (fail-closed for auto-discovered URLs), per-domain rate limiting that honours `Crawl-delay`, and conditional GET so unchanged sources are skipped.
 2. Stores them in a searchable local SQLite database with duplicate detection (URL canonicalization plus content hashing).
 3. Enriches each posting locally: scores it against your master profile, parses a salary range from the text, and extracts competency tags — no AI required.
 4. Lets you full-text search across title, company, location, country, salary, competencies and description, and sort by any column (score, title, company, location, salary, competencies, status) just by clicking the header.
@@ -28,7 +28,13 @@ The principles RJH is built on live in [MANIFESTO.md](MANIFESTO.md).
 8. *(Optional)* Runs the whole collect → enrich → (optionally) draft pipeline on a **background schedule**, unattended, staging everything for your review. It never submits.
 9. Logs every action to the database and to a dated Markdown audit trail.
 
-The scraper, email ingestion, crawler, database, search, sort, scoring, profile, resume import, export, scheduler and browser pre-fill form the **core** and run with no AI at all. The LLM document and analysis tools are an **optional add-on**, toggled in Settings; everything else keeps working when it is off.
+### Source directory & feed discovery
+
+RJH ships a curated **directory of ~180 European job sources** (`sources_catalog.csv`) — public employment services, the big aggregators, country boards, and tech/life-science/executive niches — browsable on the **Sources** tab with filters for country, category and status. For each one RJH can **search for a usable feed**, cheapest method first: `<link rel="alternate">` autodiscovery in the homepage, known public JSON/ATS endpoints (Greenhouse, Lever, Ashby, Recruitee, SmartRecruiters), then a short list of conventional feed paths. Every candidate is **validated** — fetched through the same ethical pathway and required to parse to at least one real posting — before it is recorded, and once verified you promote it to a live source with one click.
+
+Discovery runs as a slow, **bounded rolling sweep** inside the background scheduler (a capped batch of due sources per pass, cached so each is re-probed only every couple of weeks), or on demand from the Sources tab. It is honest about what it finds: several major boards (LinkedIn, Indeed, Glassdoor) have **no public feed** and are marked as such — for those, lean on job-alert email instead.
+
+The scraper, email ingestion, crawler, source directory, database, search, sort, scoring, profile, resume import, export, scheduler and browser pre-fill form the **core** and run with no AI at all. The LLM document and analysis tools are an **optional add-on**, toggled in Settings; everything else keeps working when it is off.
 
 Tuned for Western and Northern Europe. EURES (https://eures.europa.eu), the official EU job-mobility portal, is the recommended primary source; national public-employment-service feeds and company career-page feeds plug in the same way.
 
