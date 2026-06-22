@@ -21,13 +21,16 @@ WHAT IT DOES
   4. Uses your LOCAL Ollama instance to tailor a resume and cover letter per job,
      and — optionally — to extract skills/entities, translate a posting, and write
      an honest fit summary. Nothing about you ever leaves your machine.
-  5. Optionally pre-fills the application form in a real browser (Playwright) and
+  5. Compiles the tailored documents into formatted OpenDocument (.odt) files with
+     a built-in stdlib compiler (no third-party packages) — download them, or let
+     pre-fill attach them.
+  6. Optionally pre-fills the application form in a real browser (Playwright) and
      then STOPS. You review, edit, and click submit yourself. That click is the
      only thing that ever sends anything.
-  6. Can run the whole collect -> enrich -> (optional) draft pipeline on a
+  7. Can run the whole collect -> enrich -> (optional) draft pipeline on a
      background schedule, unattended, staging everything for your review. It
      never submits.
-  7. Logs every action to the database and to a dated markdown audit trail.
+  8. Logs every action to the database and to a dated markdown audit trail.
 
 ETHICS (non-negotiable, baked in)
   - Respects robots.txt for every domain before fetching.
@@ -62,6 +65,7 @@ import time
 import html
 import shutil
 import socket
+import zipfile
 import poplib
 import imaplib
 import hashlib
@@ -1970,6 +1974,181 @@ def extract_resume_text(filename, data):
 
 
 # --------------------------------------------------------------------------- #
+# ODF (.odt) document compiler — turn tailored resume / cover-letter TEXT into a
+# formatted OpenDocument file. Pure stdlib (zipfile + hand-written ODF XML), so
+# it works fully offline with NO third-party packages: an .odt is just a ZIP of
+# a few XML parts. (odfpy is used only for READING imported resumes, never here.)
+# --------------------------------------------------------------------------- #
+
+ODT_MIMETYPE = "application/vnd.oasis.opendocument.text"
+
+_ODT_NS = ('xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+           'xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" '
+           'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" '
+           'xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"')
+
+_ODT_MANIFEST = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0"'
+    ' manifest:version="1.2">'
+    '<manifest:file-entry manifest:full-path="/" manifest:media-type="' + ODT_MIMETYPE + '"/>'
+    '<manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>'
+    '<manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/>'
+    '<manifest:file-entry manifest:full-path="meta.xml" manifest:media-type="text/xml"/>'
+    '</manifest:manifest>')
+
+_ODT_STYLES = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<office:document-styles ' + _ODT_NS + ' office:version="1.2"><office:styles>'
+    '<style:default-style style:family="paragraph">'
+    '<style:text-properties fo:font-size="11pt" fo:font-family="Arial"/></style:default-style>'
+    '<style:style style:name="Standard" style:family="paragraph"/>'
+    '<style:style style:name="Title" style:family="paragraph" style:parent-style-name="Standard">'
+    '<style:paragraph-properties fo:text-align="center" fo:margin-bottom="0.05in"/>'
+    '<style:text-properties fo:font-size="22pt" fo:font-weight="bold"/></style:style>'
+    '<style:style style:name="Contact" style:family="paragraph" style:parent-style-name="Standard">'
+    '<style:paragraph-properties fo:text-align="center" fo:margin-bottom="0.2in"/>'
+    '<style:text-properties fo:font-size="10pt" fo:color="#555555"/></style:style>'
+    '<style:style style:name="Meta" style:family="paragraph" style:parent-style-name="Standard">'
+    '<style:paragraph-properties fo:text-align="right" fo:margin-bottom="0.12in"/>'
+    '<style:text-properties fo:font-size="10pt" fo:color="#555555"/></style:style>'
+    '<style:style style:name="Heading1" style:family="paragraph" style:parent-style-name="Standard">'
+    '<style:paragraph-properties fo:margin-top="0.16in" fo:margin-bottom="0.04in"'
+    ' fo:border-bottom="0.5pt solid #999999" fo:padding-bottom="0.02in"/>'
+    '<style:text-properties fo:font-size="13pt" fo:font-weight="bold" fo:color="#222222"/></style:style>'
+    '<style:style style:name="Body" style:family="paragraph" style:parent-style-name="Standard">'
+    '<style:paragraph-properties fo:margin-bottom="0.06in" fo:line-height="115%"/></style:style>'
+    '<text:list-style style:name="Bullets">'
+    '<text:list-level-style-bullet text:level="1" text:bullet-char="•">'
+    '<style:list-level-properties text:space-before="0.2in" text:min-label-width="0.15in"/>'
+    '</text:list-level-style-bullet></text:list-style>'
+    '</office:styles></office:document-styles>')
+
+_ODT_CONTENT = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<office:document-content ' + _ODT_NS + ' office:version="1.2">'
+    '<office:automatic-styles/><office:body><office:text>{body}</office:text>'
+    '</office:body></office:document-content>')
+
+_ODT_META = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"'
+    ' xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0"'
+    ' xmlns:dc="http://purl.org/dc/elements/1.1/" office:version="1.2"><office:meta>'
+    '<meta:generator>RJH - Reverse Job Hunting</meta:generator>'
+    '<dc:title>{title}</dc:title><meta:creation-date>{iso}</meta:creation-date>'
+    '</office:meta></office:document-meta>')
+
+# Section labels that should render as headings, and the bullet-line shape.
+_ODT_SECTION_RE = re.compile(
+    r"^(summary|profile|objective|professional summary|experience|work experience|"
+    r"employment( history)?|education|skills|core competenc(?:e|ie)s|competenc(?:e|ie)s|"
+    r"projects|certifications?|publications?|languages?|contact|references|"
+    r"achievements|awards|interests|volunteering)\b:?$", re.IGNORECASE)
+_ODT_BULLET_RE = re.compile(r"^\s*[-*•–·]\s+(.*)$")
+
+
+def _odt_esc(s):
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _odt_p(text, style="Body"):
+    return '<text:p text:style-name="{}">{}</text:p>'.format(style, _odt_esc(text))
+
+
+def _odt_h(text, style="Heading1"):
+    return ('<text:h text:style-name="{}" text:outline-level="1">{}</text:h>'
+            .format(style, _odt_esc(text)))
+
+
+def _odt_bullets(items):
+    lis = "".join('<text:list-item>{}</text:list-item>'.format(_odt_p(i))
+                  for i in items)
+    return '<text:list text:style-name="Bullets">{}</text:list>'.format(lis)
+
+
+def _format_body_xml(text):
+    """Render plain text into ODF paragraphs, headings and bullet lists with a
+    light, conservative heuristic. The text stays the source of truth — this is
+    purely presentation, so a missed heading just renders as a paragraph."""
+    out, bullets = [], []
+
+    def flush():
+        if bullets:
+            out.append(_odt_bullets(list(bullets)))
+            bullets.clear()
+
+    for raw in (text or "").splitlines():
+        s = raw.strip()
+        if not s:
+            flush()
+            continue
+        mb = _ODT_BULLET_RE.match(raw)
+        if mb:
+            bullets.append(mb.group(1).strip())
+            continue
+        flush()
+        is_heading = (len(s) <= 60 and not s.endswith((".", "!", "?")) and
+                      (bool(_ODT_SECTION_RE.match(s)) or s.endswith(":") or
+                       (s.isupper() and any(c.isalpha() for c in s))))
+        out.append(_odt_h(s.rstrip(":")) if is_heading else _odt_p(s))
+    flush()
+    return "".join(out) if out else '<text:p text:style-name="Standard"/>'
+
+
+def _zip_odt(content_xml, styles_xml, meta_xml, manifest_xml):
+    """Pack the parts into a valid .odt: mimetype FIRST and STORED, rest deflated."""
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        zi = zipfile.ZipInfo("mimetype")
+        zi.compress_type = zipfile.ZIP_STORED
+        z.writestr(zi, ODT_MIMETYPE.encode("ascii"))
+        z.writestr("META-INF/manifest.xml", manifest_xml)
+        z.writestr("content.xml", content_xml)
+        z.writestr("styles.xml", styles_xml)
+        z.writestr("meta.xml", meta_xml)
+    return buf.getvalue()
+
+
+def compile_document_odt(kind, text, profile, job=None):
+    """Compile a tailored resume or cover letter (kind = 'resume' |
+    'cover_letter') from its text plus the profile's contact details into .odt
+    bytes. `job` adds a subject line to a cover letter when available."""
+    profile = profile or {}
+    name = (profile.get("name") or "Candidate").strip()
+    contact = [b for b in (profile.get("email"), profile.get("phone"),
+                           profile.get("location"), profile.get("linkedin")) if b]
+    parts = [_odt_p(name, "Title")]
+    if contact:
+        parts.append(_odt_p("  ·  ".join(contact), "Contact"))
+    if kind == "cover_letter":
+        now = dt.datetime.now()
+        parts.append(_odt_p("{} {} {}".format(now.day, now.strftime("%B"), now.year),
+                            "Meta"))
+        if job and (job.get("title") or job.get("company")):
+            subj = "Re: " + " — ".join(
+                [x for x in (job.get("title"), job.get("company")) if x])
+            parts.append(_odt_h(subj))
+    parts.append(_format_body_xml(text))
+    content = _ODT_CONTENT.format(body="".join(parts))
+    title = "{} - {}".format(name, "Cover Letter" if kind == "cover_letter"
+                             else "Resume")
+    meta = _ODT_META.format(title=_odt_esc(title),
+                            iso=dt.datetime.now().isoformat(timespec="seconds"))
+    return _zip_odt(content, _ODT_STYLES, meta, _ODT_MANIFEST)
+
+
+def odt_filename(kind, profile, job=None):
+    """A tidy download name like 'Jane_Doe_Acme_Resume.odt'."""
+    stem_bits = [(profile or {}).get("name") or "RJH"]
+    if job and job.get("company"):
+        stem_bits.append(job["company"])
+    stem_bits.append("CoverLetter" if kind == "cover_letter" else "Resume")
+    stem = re.sub(r"[^A-Za-z0-9]+", "_", " ".join(stem_bits)).strip("_") or "document"
+    return stem + ".odt"
+
+
+# --------------------------------------------------------------------------- #
 # Job-list import (CSV / JSON) — feed RJH without configuring a live source
 # --------------------------------------------------------------------------- #
 
@@ -2322,18 +2501,40 @@ def _write_tmp(name, content):
     return path
 
 
+def _write_tmp_bytes(name, data):
+    os.makedirs(TMP_DIR, exist_ok=True)
+    path = os.path.join(TMP_DIR, name)
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
+def _generated_upload(kind, text, profile):
+    """Compile the generated text into a temp .odt to attach during pre-fill,
+    falling back to a plain .txt if compilation fails for any reason."""
+    if not text:
+        return None
+    base = "RJH_resume" if kind == "resume" else "RJH_cover_letter"
+    try:
+        return _write_tmp_bytes(base + ".odt",
+                                compile_document_odt(kind, text, profile))
+    except Exception as e:
+        audit("odt_compile_error", "{}: {}".format(kind, e))
+        return _write_tmp(base + ".txt", text)
+
+
 def resolve_upload_path(kind, profile, resume_text, cover_text):
-    """Prefer a curated PDF path from the profile if it exists; otherwise fall
-    back to a temp .txt of the generated document."""
+    """Prefer a curated file from the profile if it exists; otherwise attach a
+    freshly compiled .odt of the generated document (a .txt if that fails)."""
     if kind == "resume":
         p = profile.get("resume_file", "")
         if p and os.path.exists(p):
             return p
-        return _write_tmp("RJH_resume.txt", resume_text or "")
+        return _generated_upload("resume", resume_text, profile)
     p = profile.get("cover_letter_file", "")
     if p and os.path.exists(p):
         return p
-    return _write_tmp("RJH_cover_letter.txt", cover_text or "")
+    return _generated_upload("cover_letter", cover_text, profile)
 
 
 def prefill_application(job_id, job_url, cfg):
@@ -2682,11 +2883,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button class="btn sec" id="regenBtn">Regenerate</button></div>
     <label>Tailored resume</label>
     <textarea id="resumeBox"></textarea>
-    <div class="row"><button class="btn sec" onclick="copyBox('resumeBox')">Copy resume</button></div>
+    <div class="row"><button class="btn sec" onclick="copyBox('resumeBox')">Copy resume</button>
+      <button class="btn sec" id="dlResumeOdt" title="Compile a formatted OpenDocument (.odt) resume">Download .odt</button></div>
     <label>Cover letter</label>
     <textarea id="coverBox"></textarea>
     <div class="row">
       <button class="btn sec" onclick="copyBox('coverBox')">Copy cover letter</button>
+      <button class="btn sec" id="dlCoverOdt" title="Compile a formatted OpenDocument (.odt) cover letter">Download .odt</button>
       <button class="btn sec" id="saveDocsBtn">Save edits</button>
       <button class="btn" id="prefillBtn" style="margin-left:auto">Pre-fill application (you submit)</button>
     </div>
@@ -3153,6 +3356,16 @@ async function saveDocs(silent){
 
 document.getElementById('saveDocsBtn').onclick=()=>saveDocs(false);
 document.getElementById('regenBtn').onclick=()=>{if(currentJob)generate(currentJob.id);};
+async function downloadOdt(kind){
+  if(!currentJob)return;
+  const box=document.getElementById(kind==='resume'?'resumeBox':'coverBox');
+  if(!box.value.trim())return toast('Nothing to compile yet','err');
+  await saveDocs(true);                       // compile from your latest edits
+  window.location='/api/documents/'+currentJob.id+'/odt?kind='+kind;
+  toast('Compiling .odt…','ok');
+}
+document.getElementById('dlResumeOdt').onclick=()=>downloadOdt('resume');
+document.getElementById('dlCoverOdt').onclick=()=>downloadOdt('cover_letter');
 document.getElementById('prefillBtn').onclick=async()=>{
   if(!currentJob)return;
   if(!confirm('This opens a real browser and pre-fills what it can. It will NOT submit. '
@@ -3784,6 +3997,28 @@ def api_save_documents(req):
                      "AND status IN ('new','shortlisted')", (job_id,))
     audit("documents_edited", "job_id={}".format(job_id))
     return {"ok": True}
+
+
+@app.get("/api/documents/{job_id}/odt")
+def api_document_odt(req):
+    """Compile the stored resume or cover letter for a job into a formatted .odt
+    and return it as a download. ?kind=resume|cover_letter (default resume)."""
+    job_id = req.int_path("job_id")
+    kind = "cover_letter" if req.q("kind") == "cover_letter" else "resume"
+    docs = get_documents(job_id)
+    text = docs.get(kind, "")
+    if not (text or "").strip():
+        return JSONResponse(
+            {"error": "No {} to compile yet — generate or write one first.".format(
+                kind.replace("_", " "))}, status_code=404)
+    with db() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    job = dict(row) if row else None
+    profile = get_profile()
+    data = compile_document_odt(kind, text, profile, job)
+    audit("compile_odt", "job_id={} kind={}".format(job_id, kind))
+    return Response(data, media_type=ODT_MIMETYPE, headers={
+        "Content-Disposition": "attachment; filename=" + odt_filename(kind, profile, job)})
 
 
 @app.post("/api/prefill/{job_id}")

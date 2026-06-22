@@ -23,9 +23,10 @@ The principles RJH is built on live in [MANIFESTO.md](MANIFESTO.md).
 3. Enriches each posting locally: scores it against your master profile, parses a salary range from the text, and extracts competency tags — no AI required.
 4. Lets you full-text search across title, company, location, country, salary, competencies and description, and sort by any column (score, title, company, location, salary, competencies, status) just by clicking the header.
 5. *(Optional add-on)* Generates a tailored resume and cover letter per role using your local Ollama model, grounded only in your real master resume — and can also extract skills/entities, translate a non-English posting, and write an honest fit summary, all on your machine.
-6. Pre-fills the application form in a real browser using a per-site field-mapping system, then stops. You review, edit, and submit yourself.
-7. *(Optional)* Runs the whole collect → enrich → (optionally) draft pipeline on a **background schedule**, unattended, staging everything for your review. It never submits.
-8. Logs every action to the database and to a dated Markdown audit trail.
+6. Compiles those tailored documents into formatted **OpenDocument (`.odt`)** files on demand — a built-in stdlib compiler (no third-party packages), so you get a polished, editable resume and cover letter to download.
+7. Pre-fills the application form in a real browser using a per-site field-mapping system, attaching the compiled `.odt` (or your own curated file), then stops. You review, edit, and submit yourself.
+8. *(Optional)* Runs the whole collect → enrich → (optionally) draft pipeline on a **background schedule**, unattended, staging everything for your review. It never submits.
+9. Logs every action to the database and to a dated Markdown audit trail.
 
 The scraper, email ingestion, crawler, database, search, sort, scoring, profile, resume import, export, scheduler and browser pre-fill form the **core** and run with no AI at all. The LLM document and analysis tools are an **optional add-on**, toggled in Settings; everything else keeps working when it is off.
 
@@ -111,6 +112,8 @@ Careers-page crawler: add entries to the **Careers-page crawler** JSON in Settin
 Automation: the **Automation — background scheduler** card runs the whole pipeline on an interval, unattended. Optionally it auto-drafts a resume and cover letter for the top new matches (needs Ollama). It only ever *stages* work for your review — it never submits. Use **Run a pass now** to trigger one immediately.
 
 AI analysis: with AI tools on, each job row gains an **Analyze** button — local-LLM keyword/entity extraction, a translation of the posting, and an honest fit summary grounded only in your resume. Results appear in the Documents tab and are saved locally.
+
+OpenDocument export: in the Documents tab, **Download .odt** compiles the current resume or cover-letter text (including your edits) into a formatted OpenDocument file — headings, bullet lists and a contact header — using a built-in stdlib compiler, so it needs no extra packages and works offline. The same compiler produces the file that the pre-fill step attaches when you haven't set a curated résumé/cover-letter path in your Profile.
 
 AI document tools: off-by-default-friendly. The **Enable AI document tools** checkbox in Settings turns the optional Ollama layer on or off. With it off, the Documents tab and the per-job Generate buttons disappear and the rest of the app is unaffected. After enabling, use **Settings → Setup** to install Ollama and pull a model.
 
