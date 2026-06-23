@@ -354,7 +354,12 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "max_sites_per_pass": 15,
         "recheck_days": 14,
-        "probe_paths": True
+        "probe_paths": True,
+        # When a probe verifies a feed, also add it to your sources and collect
+        # from it (scored against your profile), so discovery is end-to-end:
+        # tested -> verified -> scraped. Applies to the scheduled rolling sweep
+        # and to the "Find all feeds & collect" button on the Sources tab.
+        "auto_collect": True
     },
     # Per-site pre-fill rules. The first rule whose lowercased "match" is a
     # substring of the job URL (or its host) wins. "fields" maps a category to an
@@ -2063,6 +2068,8 @@ def discover_sweep(cfg, limit=None, force=False):
     disc = cfg.get("discovery") or {}
     cap = limit if limit is not None else int(disc.get("max_sites_per_pass", 15))
     recheck_days = int(disc.get("recheck_days", 14))
+    auto_collect = bool(disc.get("auto_collect", True))
+    profile = get_profile() if auto_collect else None
     catalog = load_source_catalog()
     with db() as conn:
         cached = {r["url"]: dict(r) for r in conn.execute(
@@ -2080,6 +2087,9 @@ def discover_sweep(cfg, limit=None, force=False):
         except Exception as ex:
             st = "error"
             audit("discover_error", "{}: {}".format(e.get("name"), ex))
+        if st == "verified" and auto_collect:
+            summary["added_jobs"] = summary.get("added_jobs", 0) + \
+                collect_discovered_source(key, cfg, profile)
         summary["checked"] += 1
         summary[st] = summary.get(st, 0) + 1
     audit("discover_sweep", "checked={} verified={} none={} blocked={}".format(
@@ -2112,34 +2122,135 @@ def catalog_with_status():
     return out
 
 
+def _source_from_feed_row(row):
+    """Build a live source dict from a verified catalog_feeds row. Shared by the
+    manual "Add as source" action and by auto-collect, so promotion is identical
+    everywhere. JSON APIs carry root/map; Personio/Workday carry a base."""
+    name = row["name"] or row["feed_url"]
+    entry = {"name": name + " (discovered)", "type": row["feed_type"] or "rss",
+             "enabled": True, "url": row["feed_url"], "default_country": ""}
+    if row["meta"]:
+        try:
+            meta = json.loads(row["meta"])
+            for k in ("root", "map", "base"):
+                if meta.get(k):
+                    entry[k] = meta[k]
+        except Exception:
+            pass
+    return entry
+
+
 def add_catalog_source(key, cfg):
     """Promote a discovered feed for directory entry `key` into cfg['sources'] as
-    a normal rss/json_api source (enabled). Returns (ok, message)."""
+    a normal source (enabled). Returns (ok, message)."""
     with db() as conn:
         row = conn.execute("SELECT * FROM catalog_feeds WHERE url=?",
                             (key,)).fetchone()
     if not row or not row["feed_url"] or row["status"] != "verified":
         return False, "No verified feed for that source yet — run discovery first."
-    feed_url = row["feed_url"]
-    name = row["name"] or feed_url
     sources = cfg.setdefault("sources", [])
-    for s in sources:
-        if s.get("url") == feed_url:
-            return False, "That feed is already in your sources."
-    entry = {"name": name + " (discovered)", "type": row["feed_type"] or "rss",
-             "enabled": True, "url": feed_url, "default_country": ""}
-    if row["meta"]:
-        try:
-            meta = json.loads(row["meta"])
-            for k in ("root", "map", "base"):   # JSON APIs carry root/map; Personio/Workday a base
-                if meta.get(k):
-                    entry[k] = meta[k]
-        except Exception:
-            pass
+    if any(s.get("url") == row["feed_url"] for s in sources):
+        return False, "That feed is already in your sources."
+    entry = _source_from_feed_row(row)
     sources.append(entry)
     save_config(cfg)
-    audit("catalog_add_source", "{} -> {}".format(name, feed_url))
-    return True, "Added “{}” to your sources.".format(name)
+    audit("catalog_add_source", "{} -> {}".format(entry["name"], row["feed_url"]))
+    return True, "Added “{}” to your sources.".format(row["name"] or row["feed_url"])
+
+
+def collect_discovered_source(key, cfg, profile):
+    """For a VERIFIED directory entry: promote it to a persistent source (so the
+    scheduler keeps it fresh) and collect its postings now, scored against the
+    profile via the shared pipeline. Returns the number of new jobs added."""
+    with db() as conn:
+        row = conn.execute("SELECT * FROM catalog_feeds WHERE url=?",
+                            (key,)).fetchone()
+    if not row or row["status"] != "verified" or not row["feed_url"]:
+        return 0
+    src = _source_from_feed_row(row)
+    sources = cfg.setdefault("sources", [])
+    if not any(s.get("url") == src["url"] for s in sources):
+        sources.append(src)
+        save_config(cfg)
+        audit("catalog_add_source", "{} -> {}".format(src["name"], src["url"]))
+    try:
+        added, _ = store_normalized(collect_from_source(src, cfg), cfg, profile)
+    except Exception as e:
+        audit("discover_collect_error", "{}: {}".format(src["name"], e))
+        return 0
+    return added
+
+
+# Live progress for a full "find all feeds" run, polled by the Sources tab.
+_discovery_lock = threading.Lock()
+_discovery_run_lock = threading.Lock()       # guarantees one full sweep at a time
+_discovery_progress = {"running": False, "total": 0, "done": 0, "verified": 0,
+                       "added_jobs": 0, "current": "", "started_at": "",
+                       "finished_at": "", "error": ""}
+
+
+def discovery_progress():
+    with _discovery_lock:
+        return dict(_discovery_progress)
+
+
+def discover_all(cfg, force=False):
+    """Test EVERY catalogued source for a feed and collect from the ones that
+    succeed — the explicit, full-coverage counterpart to the bounded rolling
+    sweep. Already-verified-and-fresh sources are not re-probed but are still
+    collected. Progress is published for the UI; everything goes through the one
+    ethical fetch pathway (robots fail-closed, SSRF guard, per-domain rate limit)."""
+    catalog = load_source_catalog()
+    profile = get_profile()
+    recheck_days = int((cfg.get("discovery") or {}).get("recheck_days", 14))
+    with db() as conn:
+        cached = {r["url"]: dict(r) for r in conn.execute(
+            "SELECT url,status,checked_at FROM catalog_feeds").fetchall()}
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    with _discovery_lock:
+        _discovery_progress.update({"running": True, "total": len(catalog),
+                                    "done": 0, "verified": 0, "added_jobs": 0,
+                                    "current": "", "started_at": now,
+                                    "finished_at": "", "error": ""})
+    try:
+        for e in catalog:
+            with _discovery_lock:
+                _discovery_progress["current"] = e.get("name", "")
+            key = canonicalize_url(e["url"])
+            c = cached.get(key)
+            fresh = (c and c.get("status") == "verified"
+                     and not _due_for_recheck(c, recheck_days))
+            status = "verified"
+            if force or not fresh:
+                try:
+                    status = discover_feed_for_source(e, cfg).get("status", "error")
+                except Exception as ex:
+                    status = "error"
+                    audit("discover_error", "{}: {}".format(e.get("name"), ex))
+            if status == "verified":
+                added = collect_discovered_source(key, cfg, profile)
+                with _discovery_lock:
+                    _discovery_progress["verified"] += 1
+                    _discovery_progress["added_jobs"] += added
+            with _discovery_lock:
+                _discovery_progress["done"] += 1
+    except Exception as e:
+        with _discovery_lock:
+            _discovery_progress["error"] = str(e)
+        audit("discover_all_error", str(e))
+    finally:
+        with _discovery_lock:
+            _discovery_progress["running"] = False
+            _discovery_progress["current"] = ""
+            _discovery_progress["finished_at"] = dt.datetime.now().isoformat(
+                timespec="seconds")
+            done = _discovery_progress["done"]
+            verified = _discovery_progress["verified"]
+            jobs = _discovery_progress["added_jobs"]
+    audit("discover_all", "tested={} verified={} jobs+={}".format(done, verified, jobs))
+    return {"tested": done, "verified": verified, "added_jobs": jobs}
+
+
 
 
 # --------------------------------------------------------------------------- #
@@ -3737,12 +3848,21 @@ INDEX_HTML = r"""<!DOCTYPE html>
       </select>
     </div>
     <div class="row" style="margin-top:10px">
-      <button class="btn" id="catSweepBtn">Run a discovery sweep</button>
+      <button class="btn" id="catSweepBtn">Find all feeds &amp; collect</button>
       <button class="btn sec" id="catRefreshBtn">Refresh</button>
       <span class="muted" id="catSummary">—</span>
     </div>
-    <div class="hint">A sweep probes a bounded batch of <b>due</b> sources (default 15 per pass) to stay
-      polite; run it again to cover more of the directory. “Find feed” on a row probes just that one.</div>
+    <div id="catProgress" style="display:none;margin-top:10px">
+      <div style="height:8px;background:var(--line);border-radius:6px;overflow:hidden">
+        <div id="catBar" style="height:100%;width:0;background:linear-gradient(90deg,var(--acc),var(--acc2));transition:width .3s"></div>
+      </div>
+      <div class="hint" id="catProgressTxt" style="margin-top:6px">Starting…</div>
+    </div>
+    <div class="hint">“Find all feeds &amp; collect” tests <b>every</b> source, then — for each one with a
+      working feed — adds it to your sources and pulls its postings, scored against your profile (see the
+      <b>Jobs</b> tab afterwards). It runs in the background through the same robots/rate-limit guards, so
+      it can take a while. “Find feed” on a row probes just that one. Discovery also runs automatically as
+      part of the scheduler.</div>
   </div>
   <div class="card" style="overflow-x:auto">
     <table>
@@ -3953,13 +4073,17 @@ async function loadCatalog(){
       el.addEventListener(id==='catSearch'?'input':'change',renderCatalog);
     });
     document.getElementById('catRefreshBtn').onclick=()=>loadCatalog();
-    document.getElementById('catSweepBtn').onclick=runSweep;
+    document.getElementById('catSweepBtn').onclick=runFindAll;
     document.getElementById('catBody').addEventListener('click',onCatAction);
   }
   try{catalog=await api('/api/catalog');}catch(e){catalog=[];}
   fillCatFilter('catCountry',catalog.map(r=>r.country));
   fillCatFilter('catCategory',catalog.map(r=>r.category));
   renderCatalog();
+  // Resume the progress view if a full discovery run is already going.
+  try{const p=await api('/api/catalog/discover/progress');
+    if(p.running){document.getElementById('catProgress').style.display='block';
+      document.getElementById('catSweepBtn').disabled=true;startPolling();}}catch(e){}
 }
 function fillCatFilter(id,values){
   const sel=document.getElementById(id);
@@ -4039,14 +4163,34 @@ async function onCatAction(ev){
     btn.disabled=false;
   }
 }
-async function runSweep(){
+async function runFindAll(){
   const btn=document.getElementById('catSweepBtn');btn.disabled=true;
   try{
-    const r=await api('/api/catalog/discover',{method:'POST',
+    const r=await api('/api/catalog/discover_all',{method:'POST',
       headers:{'content-type':'application/json'},body:JSON.stringify({})});
-    toast(r.msg||'Discovery running','ok');
-    setTimeout(()=>{loadCatalog();btn.disabled=false;},6000);
-  }catch(e){toast('Could not start discovery','err');btn.disabled=false;}
+    toast(r.msg||'Testing all sources…',r.ok===false?'':'ok');
+    document.getElementById('catProgress').style.display='block';
+    startPolling();
+  }catch(e){toast('Could not start','err');btn.disabled=false;}
+}
+let _progTimer=null,_polling=false;
+function startPolling(){if(_polling)return;_polling=true;pollProgress();}
+async function pollProgress(){
+  let p;
+  try{p=await api('/api/catalog/discover/progress');}
+  catch(e){_polling=false;document.getElementById('catSweepBtn').disabled=false;return;}
+  const bar=document.getElementById('catBar'),txt=document.getElementById('catProgressTxt');
+  const pct=p.total?Math.round(100*p.done/p.total):0;
+  if(bar)bar.style.width=pct+'%';
+  if(txt)txt.textContent='Tested '+p.done+'/'+p.total+' · '+p.verified+' feeds found · '
+    +p.added_jobs+' jobs added'+(p.current?(' · now: '+p.current):'');
+  if(p.running){_progTimer=setTimeout(pollProgress,1500);return;}
+  _polling=false;
+  if(txt)txt.textContent='Done · tested '+p.done+'/'+p.total+' · '+p.verified
+    +' feeds · '+p.added_jobs+' jobs added';
+  document.getElementById('catSweepBtn').disabled=false;
+  if(p.done)toast(p.verified+' feeds found · '+p.added_jobs+' jobs added','ok');
+  loadCatalog();if(typeof loadJobs==='function')loadJobs();
 }
 
 async function refreshOllama(){
@@ -4844,6 +4988,34 @@ def api_catalog_discover(req):
             audit("discover_error", str(e))
     threading.Thread(target=_run, daemon=True).start()
     return {"ok": True, "msg": "Feed discovery is running in the background."}
+
+
+@app.post("/api/catalog/discover_all")
+def api_catalog_discover_all(req):
+    """Test EVERY source and collect from those that succeed, in the background.
+    Returns immediately; the Sources tab polls /api/catalog/discover/progress."""
+    data = req.json() if req.body() else {}
+    force = bool(data.get("force"))
+    if not _discovery_run_lock.acquire(blocking=False):
+        return {"ok": False, "running": True,
+                "msg": "Discovery is already running."}
+    cfg = load_config()
+
+    def _run():
+        try:
+            discover_all(cfg, force=force)
+        except Exception as e:
+            audit("discover_all_error", str(e))
+        finally:
+            _discovery_run_lock.release()
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "running": True,
+            "msg": "Testing all sources and collecting matches…"}
+
+
+@app.get("/api/catalog/discover/progress")
+def api_catalog_discover_progress(req):
+    return discovery_progress()
 
 
 @app.post("/api/catalog/add_source")

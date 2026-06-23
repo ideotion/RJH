@@ -288,5 +288,71 @@ class DiagnosticsTests(unittest.TestCase):
             self.assertIn(expected, names)
 
 
+class DiscoverAllTests(unittest.TestCase):
+    """The "Find all feeds & collect" path: probe everything, then promote and
+    collect from the ones that verify. Network calls are stubbed."""
+
+    def setUp(self):
+        _use_temp_db()
+        self._disc = rjh.discover_feed_for_source
+        self._coll = rjh.collect_from_source
+
+    def tearDown(self):
+        rjh.discover_feed_for_source = self._disc
+        rjh.collect_from_source = self._coll
+
+    def test_discover_all_promotes_and_collects(self):
+        state = {"n": 0}
+
+        def fake_disc(entry, cfg):
+            state["n"] += 1
+            verified = state["n"] <= 3
+            key = rjh.canonicalize_url(entry["url"])
+            rec = {"url": key, "name": entry["name"],
+                   "feed_url": ("https://feed/%d" % state["n"]) if verified else "",
+                   "feed_type": "rss" if verified else "", "method": "x",
+                   "status": "verified" if verified else "none", "detail": "",
+                   "item_count": 2 if verified else 0, "meta": "",
+                   "checked_at": rjh.dt.datetime.now().isoformat()}
+            rjh._save_catalog_feed(rec)
+            return rec
+
+        def fake_collect(src, cfg):
+            return [{"source": src["name"], "title": "Role %s-%d" % (src["url"][-1], i),
+                     "company": "C%d" % i, "country": "DE",
+                     "url": src["url"] + "/job%d" % i,
+                     "description": "python role %d" % i, "posted_at": ""}
+                    for i in (1, 2)]
+
+        rjh.discover_feed_for_source = fake_disc
+        rjh.collect_from_source = fake_collect
+
+        cfg = dict(rjh.DEFAULT_CONFIG)
+        cfg["sources"] = []
+        res = rjh.discover_all(cfg, force=True)
+        self.assertEqual(res["verified"], 3)
+        self.assertEqual(res["added_jobs"], 6)            # 2 per verified source
+        promoted = [s for s in cfg["sources"] if "(discovered)" in s.get("name", "")]
+        self.assertEqual(len(promoted), 3)
+
+        prog = rjh.discovery_progress()
+        self.assertFalse(prog["running"])
+        self.assertEqual(prog["done"], prog["total"])
+
+        # Idempotent: re-running adds no duplicate jobs or sources.
+        res2 = rjh.discover_all(cfg, force=True)
+        self.assertEqual(res2["added_jobs"], 0)
+        self.assertEqual(
+            len([s for s in cfg["sources"] if "(discovered)" in s.get("name", "")]), 3)
+
+    def test_collect_discovered_requires_verified(self):
+        key = rjh.canonicalize_url("https://eures.europa.eu")
+        rjh._save_catalog_feed({"url": key, "name": "X", "feed_url": "", "feed_type": "",
+                                "method": "probe", "status": "none", "detail": "",
+                                "item_count": 0, "meta": "",
+                                "checked_at": rjh.dt.datetime.now().isoformat()})
+        self.assertEqual(rjh.collect_discovered_source(key, {"sources": []}, {}), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
