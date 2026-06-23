@@ -30,7 +30,7 @@ The principles RJH is built on live in [MANIFESTO.md](MANIFESTO.md).
 
 ### Source directory & feed discovery
 
-RJH ships a curated **directory of ~180 European job sources** (`sources_catalog.csv`) — public employment services, the big aggregators, country boards, and tech/life-science/executive niches — browsable on the **Sources** tab with filters for country, category and status. For each one RJH can **search for a usable feed**, cheapest method first: `<link rel="alternate">` autodiscovery in the homepage, known public JSON/ATS endpoints (Greenhouse, Lever, Ashby, Recruitee, SmartRecruiters), then a short list of conventional feed paths. Every candidate is **validated** — fetched through the same ethical pathway and required to parse to at least one real posting — before it is recorded, and once verified you promote it to a live source with one click.
+RJH ships a curated **directory of ~180 European job sources** (`sources_catalog.csv`) — public employment services, the big aggregators, country boards, and tech/life-science/executive niches — browsable on the **Sources** tab with filters for country, category and status. For each one RJH can **search for a usable feed**, cheapest method first: `<link rel="alternate">` autodiscovery in the homepage, known public JSON/ATS endpoints (Greenhouse, Lever, Ashby, Recruitee, SmartRecruiters, Personio's XML feed, and Workday's CXS API over POST), then a short list of conventional feed paths. Every candidate is **validated** — fetched through the same ethical pathway and required to parse to at least one real posting — before it is recorded, and once verified you promote it to a live source with one click.
 
 Discovery runs as a slow, **bounded rolling sweep** inside the background scheduler (a capped batch of due sources per pass, cached so each is re-probed only every couple of weeks), or on demand from the Sources tab. It is honest about what it finds: several major boards (LinkedIn, Indeed, Glassdoor) have **no public feed** and are marked as such — for those, lean on job-alert email instead.
 
@@ -139,9 +139,20 @@ Profile: fill in your master profile, keywords (which drive scoring), and option
 
 Recently shipped: job-alert email ingestion (IMAP/POP3/`.eml`), a careers-page crawler, a hardened single fetch pathway (SSRF guard, fail-closed robots, `Crawl-delay`, conditional GET), local-LLM translation/keyword-extraction/fit summaries, and a background scheduler.
 
+## Diagnostics
+
+Something not behaving? **Settings → Diagnostics** downloads a redacted `.zip` snapshot — environment and build fingerprint, your settings with secrets removed, database counts, scheduler and discovery state, and the recent audit log (with errors called out). Your resume, profile text, job descriptions and passwords are never included, so the bundle is safe to attach to a bug report or hand back for help debugging.
+
 ## Contributing
 
 Issues and pull requests welcome. Two hard rules: keep the human-in-the-loop submit guarantee, and respect robots.txt and rate limits. Anything that automates submission or evades anti-bot measures will be declined.
+
+The core is pure standard library, so there is nothing to install to develop or test. The offline test suite (`tests/`) and a byte-compile run on every push/PR via GitHub Actions:
+
+```sh
+python -m py_compile rjh.py
+python -m unittest discover -s tests -p "test_*.py"
+```
 
 ## Disclaimer
 

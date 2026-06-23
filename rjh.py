@@ -784,12 +784,15 @@ def _set_fetch_meta(url, etag, last_modified):
             (url_hash(url), url, etag, last_modified, now))
 
 
-def ethical_get(url, cfg, *, strict=True, conditional=False, extra_headers=None):
+def ethical_get(url, cfg, *, strict=True, conditional=False, extra_headers=None,
+                method="GET", json_body=None):
     """The single, mandatory fetch pathway. Enforces, in order: an SSRF guard
     (strict only), robots.txt (fail-closed when strict), and the per-domain rate
     limit incl. Crawl-delay. Optionally sends conditional-GET validators and
-    stores the new ones. Returns an _HTTPResponse (with a `.not_modified` flag),
-    or None when the fetch was refused — the reason is written to the audit log."""
+    stores the new ones. With method="POST" it sends a JSON body through the same
+    guards (used by JSON APIs like Workday that require POST). Returns an
+    _HTTPResponse (with a `.not_modified` flag), or None when the fetch was
+    refused — the reason is written to the audit log."""
     if strict and not url_is_fetchable(url):
         audit("fetch_blocked", "non-public or non-http target: {}".format(url))
         return None
@@ -799,13 +802,18 @@ def ethical_get(url, cfg, *, strict=True, conditional=False, extra_headers=None)
     headers = {"User-Agent": USER_AGENT}
     if extra_headers:
         headers.update(extra_headers)
-    if conditional:
+    if conditional and method == "GET":
         etag, last_mod = _get_fetch_meta(url)
         if etag:
             headers["If-None-Match"] = etag
         if last_mod:
             headers["If-Modified-Since"] = last_mod
     _rate_limit_wait(url, cfg)
+    if method == "POST":
+        resp = requests.post(url, json=json_body, headers=headers,
+                             timeout=cfg.get("request_timeout", 20))
+        resp.not_modified = False
+        return resp
     resp = requests.get(url, headers=headers, timeout=cfg.get("request_timeout", 20))
     resp.not_modified = (resp.status_code == 304)
     if conditional and resp.status_code == 200:
@@ -1001,6 +1009,80 @@ def parse_json_api(text, src):
     return out
 
 
+def parse_personio_xml(text, src):
+    """Personio publishes a job feed at <careers-host>/xml — a custom XML schema
+    (<position> elements), not RSS, so it needs its own parser. Pure parsing, no
+    network, so it is unit-testable. `src['base']` (or the url minus /xml) is the
+    careers host used to build each posting's public URL."""
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return []
+    base = (src.get("base") or re.sub(r"/xml/?$", "", src.get("url", ""))).rstrip("/")
+
+    def child_text(el, name):
+        for c in el:
+            if c.tag.split("}")[-1] == name:
+                return (c.text or "").strip()
+        return ""
+
+    out = []
+    for pos in root.iter():
+        if pos.tag.split("}")[-1] != "position":
+            continue
+        pid = child_text(pos, "id")
+        title = child_text(pos, "name")
+        if not pid or not title:
+            continue
+        desc_parts = [child_text(jd, "value") for jd in pos.iter()
+                      if jd.tag.split("}")[-1] == "jobDescription"]
+        desc = html.unescape(re.sub(r"<[^>]+>", " ", " ".join(filter(None, desc_parts))))
+        out.append({
+            "source": src["name"],
+            "title": html.unescape(title),
+            "company": child_text(pos, "subcompany"),
+            "location": child_text(pos, "office"),
+            "country": src.get("default_country", ""),
+            "url": "{}/job/{}".format(base, pid),
+            "description": re.sub(r"\s+", " ", desc).strip(),
+            "salary": "",
+            "posted_at": _normalize_date(child_text(pos, "createdAt")),
+        })
+    return out
+
+
+def parse_workday_json(text, src):
+    """Workday's CXS endpoint returns {"jobPostings":[...]}; each posting carries
+    an externalPath we join to the localized site base for the public URL. Pure
+    parsing — the POST that fetches it lives in collect_from_source/discovery."""
+    data = json.loads(text)
+    base = (src.get("base") or "").rstrip("/")
+    postings = data.get("jobPostings") if isinstance(data, dict) else None
+    out = []
+    for it in postings or []:
+        if not isinstance(it, dict):
+            continue
+        ext = it.get("externalPath") or ""
+        title = it.get("title") or ""
+        if not ext or not title:
+            continue
+        out.append({
+            "source": src["name"],
+            "title": html.unescape(str(title)),
+            "company": "",
+            "location": str(it.get("locationsText") or ""),
+            "country": src.get("default_country", ""),
+            "url": (base + ext) if base else ext,
+            "description": "",
+            "salary": "",
+            "posted_at": "",
+        })
+    return out
+
+
+WORKDAY_QUERY = {"appliedFacets": {}, "limit": 20, "offset": 0, "searchText": ""}
+
+
 def collect_from_source(src, cfg):
     """Returns a list of normalized job dicts for one source."""
     out = []
@@ -1061,6 +1143,39 @@ def collect_from_source(src, cfg):
                 audit("fetch_failed", "{} -> {}".format(url, resp.status_code))
                 return out
             out = parse_json_api(resp.text, src)
+        except Exception as e:
+            audit("fetch_error", "{}: {}".format(url, e))
+        return out
+
+    if stype == "personio":
+        url = src.get("url", "")
+        if not url or url.startswith("PASTE_"):
+            return out
+        try:
+            resp = ethical_get(url, cfg, strict=False, conditional=True)
+            if resp is None or resp.not_modified:
+                return out
+            if resp.status_code != 200:
+                audit("fetch_failed", "{} -> {}".format(url, resp.status_code))
+                return out
+            out = parse_personio_xml(resp.text, src)
+        except Exception as e:
+            audit("fetch_error", "{}: {}".format(url, e))
+        return out
+
+    if stype == "workday":
+        url = src.get("url", "")          # the CXS .../jobs endpoint (POST)
+        if not url or url.startswith("PASTE_"):
+            return out
+        try:
+            resp = ethical_get(url, cfg, strict=False, method="POST",
+                               json_body=WORKDAY_QUERY)
+            if resp is None:
+                return out
+            if resp.status_code != 200:
+                audit("fetch_failed", "{} -> {}".format(url, resp.status_code))
+                return out
+            out = parse_workday_json(resp.text, src)
         except Exception as e:
             audit("fetch_error", "{}: {}".format(url, e))
         return out
@@ -1646,51 +1761,69 @@ _ATS_PROVIDERS = [
     ("greenhouse",
      re.compile(r"(?:boards|job-boards)\.greenhouse\.io/(?:embed/job_board\?for=)?"
                 r"([A-Za-z0-9_.-]+)", re.I),
-     lambda org: {
-         "url": "https://boards-api.greenhouse.io/v1/boards/%s/jobs?content=true" % org,
+     lambda m: {
+         "url": "https://boards-api.greenhouse.io/v1/boards/%s/jobs?content=true" % m.group(1),
          "type": "json_api", "root": "jobs",
          "map": {"title": "title", "url": "absolute_url", "location": "location.name",
                  "description": "content", "posted_at": "updated_at"}}),
     ("lever",
      re.compile(r"jobs\.lever\.co/([A-Za-z0-9_.-]+)", re.I),
-     lambda org: {
-         "url": "https://api.lever.co/v0/postings/%s?mode=json" % org,
+     lambda m: {
+         "url": "https://api.lever.co/v0/postings/%s?mode=json" % m.group(1),
          "type": "json_api",
          "map": {"title": "text", "url": "hostedUrl", "location": "categories.location",
                  "description": "descriptionPlain", "posted_at": "createdAt"}}),
     ("ashby",
      re.compile(r"jobs\.ashbyhq\.com/([A-Za-z0-9_.-]+)", re.I),
-     lambda org: {
-         "url": "https://api.ashbyhq.com/posting-api/job-board/%s" % org,
+     lambda m: {
+         "url": "https://api.ashbyhq.com/posting-api/job-board/%s" % m.group(1),
          "type": "json_api", "root": "jobs",
          "map": {"title": "title", "url": "jobUrl", "location": "location",
                  "description": "descriptionPlain", "posted_at": "publishedAt"}}),
     ("recruitee",
      re.compile(r"([A-Za-z0-9_-]+)\.recruitee\.com", re.I),
-     lambda org: {
-         "url": "https://%s.recruitee.com/api/offers/" % org,
+     lambda m: {
+         "url": "https://%s.recruitee.com/api/offers/" % m.group(1),
          "type": "json_api", "root": "offers",
          "map": {"title": "title", "url": "careers_url", "location": "location",
                  "description": "description", "posted_at": "published_at"}}),
     ("smartrecruiters",
      re.compile(r"(?:careers|jobs)\.smartrecruiters\.com/([A-Za-z0-9_-]+)", re.I),
-     lambda org: {
-         "url": "https://api.smartrecruiters.com/v1/companies/%s/postings" % org,
+     lambda m: {
+         "url": "https://api.smartrecruiters.com/v1/companies/%s/postings" % m.group(1),
          "type": "json_api", "root": "content",
          "map": {"title": "name", "url": "ref", "location": "location.city",
                  "posted_at": "releasedDate"}}),
+    # Personio: a custom XML feed at <org>.jobs.personio.<tld>/xml.
+    ("personio",
+     re.compile(r"([a-z0-9-]+)\.jobs\.personio\.(de|com|eu)", re.I),
+     lambda m: {
+         "url": "https://%s.jobs.personio.%s/xml" % (m.group(1), m.group(2).lower()),
+         "base": "https://%s.jobs.personio.%s" % (m.group(1), m.group(2).lower()),
+         "type": "personio"}),
+    # Workday: tenant.<dc>.myworkdayjobs.com/[locale/]<site> -> CXS JSON over POST.
+    ("workday",
+     re.compile(r"([a-z0-9-]+)\.(wd\d+)\.myworkdayjobs\.com/"
+                r"(?!wday/)(?:([a-z]{2}-[A-Z]{2})/)?([A-Za-z0-9_-]+)"),
+     lambda m: {
+         "url": "https://%s.%s.myworkdayjobs.com/wday/cxs/%s/%s/jobs" % (
+             m.group(1), m.group(2), m.group(1), m.group(4)),
+         "base": "https://%s.%s.myworkdayjobs.com/%s/%s" % (
+             m.group(1), m.group(2), m.group(3) or "en-US", m.group(4)),
+         "type": "workday"}),
 ]
 
 
 def _ats_endpoint(url):
     """If `url` points at (or embeds) a known ATS board, return a source-like
-    dict {name,url,type,root?,map} for its public JSON API, else None."""
+    dict {name,type,url,...} for its public feed/API, else None. Covers JSON
+    boards, Personio's XML feed, and Workday's CXS (POST) endpoint."""
     if not url:
         return None
     for name, rx, build in _ATS_PROVIDERS:
         m = rx.search(url)
         if m and m.group(1).lower() not in _ATS_STOP:
-            ep = build(m.group(1))
+            ep = build(m)
             ep["name"] = name
             return ep
     return None
@@ -1746,6 +1879,52 @@ def _validate_json(endpoint, cfg):
     return (bool(jobs), len(jobs), "" if jobs else "no postings in API")
 
 
+def _validate_personio(ep, cfg):
+    """Confirm a Personio XML feed parses to >=1 posting. (ok, count, detail)."""
+    try:
+        resp = ethical_get(ep["url"], cfg, strict=True, conditional=False)
+    except Exception as e:
+        return False, 0, "error: {}".format(e)
+    if resp is None:
+        return False, 0, "blocked by robots/guard"
+    if resp.status_code != 200:
+        return False, 0, "http {}".format(resp.status_code)
+    src = dict(ep)
+    src["name"] = "probe"
+    jobs = parse_personio_xml(resp.text, src)
+    return (bool(jobs), len(jobs), "" if jobs else "no postings in feed")
+
+
+def _validate_workday(ep, cfg):
+    """Confirm a Workday CXS endpoint (POST) returns >=1 posting. (ok, count, detail)."""
+    try:
+        resp = ethical_get(ep["url"], cfg, strict=True, conditional=False,
+                           method="POST", json_body=WORKDAY_QUERY)
+    except Exception as e:
+        return False, 0, "error: {}".format(e)
+    if resp is None:
+        return False, 0, "blocked by robots/guard"
+    if resp.status_code != 200:
+        return False, 0, "http {}".format(resp.status_code)
+    try:
+        src = dict(ep)
+        src["name"] = "probe"
+        jobs = parse_workday_json(resp.text, src)
+    except Exception:
+        return False, 0, "could not parse Workday API"
+    return (bool(jobs), len(jobs), "" if jobs else "no postings in API")
+
+
+def _validate_endpoint(ep, cfg):
+    """Dispatch an ATS endpoint to the right validator by its type."""
+    t = ep.get("type")
+    if t == "personio":
+        return _validate_personio(ep, cfg)
+    if t == "workday":
+        return _validate_workday(ep, cfg)
+    return _validate_json(ep, cfg)
+
+
 def _seed_status(entry):
     """Map the directory's free-text rss_status into a decisive (status, detail),
     or None meaning "unknown — go probe it"."""
@@ -1788,8 +1967,8 @@ def discover_feed_for_source(entry, cfg):
         _save_catalog_feed(rec)
         return rec
 
-    def json_meta(ep):
-        return json.dumps({k: ep[k] for k in ("root", "map") if k in ep})
+    def ats_meta(ep):
+        return json.dumps({k: ep[k] for k in ("root", "map", "base") if k in ep})
 
     # 0) Honour what the directory already knows. A few giants have NO public
     #    feed — record that (and steer the user to email alerts) without probing.
@@ -1804,13 +1983,13 @@ def discover_feed_for_source(entry, cfg):
         if status == "discontinued":
             return record("", "", "seed", "discontinued", detail, 0)
 
-    # 1) ATS / known JSON endpoint straight from the listed URL.
+    # 1) ATS / known feed endpoint straight from the listed URL.
     ep = _detect_ats([site])
     if ep:
-        ok, n, _ = _validate_json(ep, cfg)
+        ok, n, _ = _validate_endpoint(ep, cfg)
         if ok:
-            return record(ep["url"], "json_api", "ats:" + ep["name"],
-                          "verified", "", n, json_meta(ep))
+            return record(ep["url"], ep["type"], "ats:" + ep["name"],
+                          "verified", "", n, ats_meta(ep))
 
     # 2) Fetch the homepage once: <link> autodiscovery + embedded-ATS detection.
     root = _site_root(site)
@@ -1844,10 +2023,10 @@ def discover_feed_for_source(entry, cfg):
     # 2b) An ATS board linked from the homepage.
     ep = _detect_ats(hrefs)
     if ep:
-        ok, n, _ = _validate_json(ep, cfg)
+        ok, n, _ = _validate_endpoint(ep, cfg)
         if ok:
-            return record(ep["url"], "json_api", "ats:" + ep["name"],
-                          "verified", "", n, json_meta(ep))
+            return record(ep["url"], ep["type"], "ats:" + ep["name"],
+                          "verified", "", n, ats_meta(ep))
 
     # 3) Conventional feed paths (opt-out via discovery.probe_paths).
     if (cfg.get("discovery") or {}).get("probe_paths", True):
@@ -1949,13 +2128,12 @@ def add_catalog_source(key, cfg):
             return False, "That feed is already in your sources."
     entry = {"name": name + " (discovered)", "type": row["feed_type"] or "rss",
              "enabled": True, "url": feed_url, "default_country": ""}
-    if entry["type"] == "json_api" and row["meta"]:
+    if row["meta"]:
         try:
             meta = json.loads(row["meta"])
-            if meta.get("root"):
-                entry["root"] = meta["root"]
-            if meta.get("map"):
-                entry["map"] = meta["map"]
+            for k in ("root", "map", "base"):   # JSON APIs carry root/map; Personio/Workday a base
+                if meta.get(k):
+                    entry[k] = meta[k]
         except Exception:
             pass
     sources.append(entry)
@@ -2865,6 +3043,143 @@ def scheduler_status():
 
 
 # --------------------------------------------------------------------------- #
+# Diagnostics — a redacted, downloadable snapshot for debugging. Everything is
+# local; secrets are redacted and candidate PII (your resume/profile text, full
+# job descriptions) is deliberately left out, so a bundle is safe to share — e.g.
+# to hand back for a "here's what happened, help me fix it" workflow.
+# --------------------------------------------------------------------------- #
+
+_SECRET_KEY_RE = re.compile(r"pass|secret|token|api_?key|credential", re.I)
+
+
+def _count_by(items, keyfn):
+    out = {}
+    for it in items:
+        k = keyfn(it)
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
+def _redact(obj, key=""):
+    """Recursively redact secret-looking values: anything under a credential-ish
+    key is masked, and email-like usernames are partially masked."""
+    if isinstance(obj, dict):
+        return {k: _redact(v, k) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact(v, key) for v in obj]
+    if isinstance(obj, str):
+        if _SECRET_KEY_RE.search(key or ""):
+            return "***redacted***" if obj else ""
+        if key.lower() in ("username", "user") and "@" in obj:
+            name, _, dom = obj.partition("@")
+            return (name[:2] + "***@" + dom) if name else "***@" + dom
+        return obj
+    return obj
+
+
+def _rjh_fingerprint():
+    """A short content hash of rjh.py, so a downloaded log records exactly which
+    build produced it — handy when diagnostics are pasted back for debugging."""
+    try:
+        with open(os.path.abspath(__file__), "rb") as f:
+            data = f.read()
+        return {"bytes": len(data), "sha256_12": hashlib.sha256(data).hexdigest()[:12]}
+    except Exception:
+        return {}
+
+
+def collect_diagnostics(cfg=None, audit_limit=200):
+    """Build a redacted diagnostics bundle: environment, (redacted) config, table
+    counts, scheduler + discovery state, and recent audit/error lines. No network
+    beyond a quick, guarded local Ollama ping."""
+    cfg = cfg or load_config()
+    diag = {"generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "build": _rjh_fingerprint(),
+            "environment": {
+                "python": sys.version.split()[0],
+                "implementation": platform.python_implementation(),
+                "platform": platform.platform(),
+                "data_dir": DATA_DIR,
+                "catalog_present": os.path.exists(CATALOG_CSV_PATH)}}
+    addons = {}
+    for mod in ("playwright", "pypdf", "odf"):
+        try:
+            __import__(mod)
+            addons[mod] = True
+        except Exception:
+            addons[mod] = False
+    diag["optional_modules"] = addons
+    try:
+        diag["ollama"] = (ollama_status(cfg) if cfg.get("llm_enabled", True)
+                          else {"enabled": False})
+    except Exception as e:
+        diag["ollama"] = {"error": str(e)}
+    diag["config"] = _redact(cfg)
+    srcs = cfg.get("sources") or []
+    diag["sources_summary"] = {
+        "configured": len(srcs),
+        "enabled": sum(1 for s in srcs if s.get("enabled")),
+        "by_type": _count_by(srcs, lambda s: s.get("type", "?")),
+        "crawl_sources": len(cfg.get("crawl_sources") or [])}
+    with db() as conn:
+        def scalar(q):
+            r = conn.execute(q).fetchone()
+            return r[0] if r else 0
+        diag["counts"] = {
+            "jobs": scalar("SELECT COUNT(*) FROM jobs"),
+            "documents": scalar("SELECT COUNT(*) FROM documents"),
+            "analysis": scalar("SELECT COUNT(*) FROM analysis"),
+            "audit": scalar("SELECT COUNT(*) FROM audit"),
+            "scheduler_runs": scalar("SELECT COUNT(*) FROM scheduler_runs"),
+            "catalog_feeds": scalar("SELECT COUNT(*) FROM catalog_feeds"),
+            "fetch_meta": scalar("SELECT COUNT(*) FROM fetch_meta")}
+        diag["jobs_by_status"] = {r["status"]: r["c"] for r in conn.execute(
+            "SELECT status, COUNT(*) c FROM jobs GROUP BY status").fetchall()}
+        diag["discovery_by_status"] = {r["status"]: r["c"] for r in conn.execute(
+            "SELECT status, COUNT(*) c FROM catalog_feeds GROUP BY status").fetchall()}
+        diag["discovery_by_type"] = {(r["feed_type"] or "-"): r["c"] for r in conn.execute(
+            "SELECT feed_type, COUNT(*) c FROM catalog_feeds GROUP BY feed_type").fetchall()}
+        diag["recent_audit"] = [dict(r) for r in conn.execute(
+            "SELECT ts, action, detail FROM audit ORDER BY id DESC LIMIT ?",
+            (audit_limit,)).fetchall()]
+        diag["recent_errors"] = [dict(r) for r in conn.execute(
+            "SELECT ts, action, detail FROM audit WHERE action LIKE '%error%' "
+            "OR action LIKE '%fail%' OR action LIKE '%blocked%' "
+            "ORDER BY id DESC LIMIT 100").fetchall()]
+    try:
+        diag["scheduler"] = scheduler_status()
+    except Exception as e:
+        diag["scheduler"] = {"error": str(e)}
+    return diag
+
+
+def diagnostics_zip(cfg=None):
+    """Bundle several logs into one .zip for download: the diagnostics JSON, the
+    redacted config, recent audit as Markdown, and the discovery directory state."""
+    cfg = cfg or load_config()
+    diag = collect_diagnostics(cfg)
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("diagnostics.json", json.dumps(diag, indent=2, ensure_ascii=False))
+        z.writestr("config.redacted.json",
+                   json.dumps(diag["config"], indent=2, ensure_ascii=False))
+        lines = ["# RJH audit — most recent {} entries".format(len(diag["recent_audit"])),
+                 "", "_generated {}_".format(diag["generated_at"]), ""]
+        for r in diag["recent_audit"]:
+            lines.append("- `{}`  **{}**  {}".format(
+                r.get("ts", ""), r.get("action", ""), r.get("detail", "")))
+        z.writestr("audit.recent.md", "\n".join(lines) + "\n")
+        with db() as conn:
+            feeds = [dict(r) for r in conn.execute(
+                "SELECT name,status,feed_type,feed_url,detail,item_count,checked_at "
+                "FROM catalog_feeds ORDER BY status, name").fetchall()]
+        z.writestr("discovery.json", json.dumps(feeds, indent=2, ensure_ascii=False))
+        z.writestr("scheduler.json",
+                   json.dumps(diag.get("scheduler", {}), indent=2, ensure_ascii=False))
+    return buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
 # Per-site pre-fill engine (two layers; NEVER submits)
 # --------------------------------------------------------------------------- #
 
@@ -3574,6 +3889,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
       multilingual generic fallback. Adding a site needs no code change.</p>
     <textarea id="cMappings" style="min-height:200px"></textarea>
   </div>
+  <div class="card">
+    <div class="group-title">Diagnostics</div>
+    <p class="muted" style="margin:0 0 8px">Download a redacted snapshot — environment, settings
+      (secrets removed), database counts, scheduler &amp; discovery state, and the recent audit log —
+      bundled as a <code>.zip</code> of several files. Safe to share for debugging; your resume,
+      profile text, job descriptions and passwords are never included.</p>
+    <div class="row">
+      <a class="btn" href="/api/diagnostics/download">Download diagnostics (.zip)</a>
+      <button class="btn sec" id="diagSummaryBtn">Show summary</button>
+    </div>
+    <pre id="diagSummary" style="display:none;white-space:pre-wrap;margin-top:10px;
+      background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;
+      max-height:240px;overflow:auto;font-size:12px;color:var(--mut)"></pre>
+  </div>
   <div class="card"><div class="row"><button class="btn" id="saveSettings">Save settings</button>
     <span class="muted">Restart the app to change host/port.</span></div></div>
 </section>
@@ -4172,6 +4501,22 @@ document.getElementById('schedRunNowBtn').onclick=async()=>{
     setTimeout(()=>{loadSchedulerStatus();loadJobs();},2000);}
   catch(e){toast('Could not start a pass','err');}
 };
+document.getElementById('diagSummaryBtn').onclick=async()=>{
+  const el=document.getElementById('diagSummary');
+  try{
+    const d=await api('/api/diagnostics');
+    const c=d.counts||{},ss=d.sources_summary||{},env=d.environment||{};
+    el.textContent=
+      'build '+((d.build||{}).sha256_12||'?')+' · python '+(env.python||'?')+' · '+(env.platform||'')+'\n'
+      +'jobs '+(c.jobs||0)+' '+JSON.stringify(d.jobs_by_status||{})+'\n'
+      +'discovery '+JSON.stringify(d.discovery_by_status||{})+'  types '+JSON.stringify(d.discovery_by_type||{})+'\n'
+      +'sources '+(ss.enabled||0)+'/'+(ss.configured||0)+' enabled  '+JSON.stringify(ss.by_type||{})+'\n'
+      +'scheduler '+(((d.scheduler||{}).running)?'running':'stopped')+'\n'
+      +'recent errors '+((d.recent_errors||[]).length)
+      +(d.recent_errors&&d.recent_errors[0]?(' (newest: '+d.recent_errors[0].action+')'):'');
+    el.style.display='block';
+  }catch(e){toast('Could not load diagnostics','err');}
+};
 document.getElementById('fetchEmailBtn').onclick=async()=>{
   showOverlay('Fetching job-alert email…','Reading your mailbox read-only and parsing locally.');
   try{
@@ -4687,6 +5032,22 @@ def api_audit(req):
         rows = conn.execute(
             "SELECT ts, action, detail FROM audit ORDER BY id DESC LIMIT 300").fetchall()
     return [dict(r) for r in rows]
+
+
+@app.get("/api/diagnostics")
+def api_diagnostics(req):
+    """A redacted diagnostics snapshot (for the Settings summary / quick copy)."""
+    return collect_diagnostics(load_config())
+
+
+@app.get("/api/diagnostics/download")
+def api_diagnostics_download(req):
+    """Download the diagnostics as a .zip bundle of several logs."""
+    data = diagnostics_zip(load_config())
+    fn = "rjh-diagnostics-{}.zip".format(dt.datetime.now().strftime("%Y%m%d-%H%M%S"))
+    audit("diagnostics_download", fn)
+    return Response(data, media_type="application/zip",
+                    headers={"Content-Disposition": "attachment; filename=" + fn})
 
 
 @app.get("/api/export")
